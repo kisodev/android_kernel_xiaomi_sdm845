@@ -1264,6 +1264,11 @@ int dsi_display_set_power(struct drm_connector *connector,
 		return -EINVAL;
 	}
 
+	if (!dev) {
+		DSI_ERR("Invalid DRM device\n");
+		return -EINVAL;
+    }
+
 	g_notify_data.data = &power_mode;
 	switch (power_mode) {
 	case SDE_MODE_DPMS_LP1:
