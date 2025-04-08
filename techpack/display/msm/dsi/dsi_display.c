@@ -1264,6 +1264,7 @@ int dsi_display_set_power(struct drm_connector *connector,
 		return -EINVAL;
 	}
 
+	dev = display->drm_dev;
 	if (!dev) {
 		DSI_ERR("Invalid DRM device\n");
 		return -EINVAL;
