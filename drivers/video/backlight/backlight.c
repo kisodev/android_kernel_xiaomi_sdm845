@@ -22,6 +22,10 @@
 #include <asm/backlight.h>
 #endif
 
+#ifdef CONFIG_MACH_XIAOMI_E1N
+#include <linux/leds.h>
+#endif
+
 static struct list_head backlight_dev_list;
 static struct mutex backlight_dev_list_mutex;
 static struct blocking_notifier_head backlight_notifier;
@@ -308,6 +312,15 @@ static void bl_device_release(struct device *dev)
 	struct backlight_device *bd = to_backlight_device(dev);
 	kfree(bd);
 }
+
+#ifdef CONFIG_MACH_XIAOMI_E1N
+int qpnp_wled_cabc(struct led_classdev *led_cdev, bool enable)
+{
+	pr_debug("qpnp_wled_cabc: WLED not compiled\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qpnp_wled_cabc);
+#endif
 
 static ssize_t brightness_clone_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
