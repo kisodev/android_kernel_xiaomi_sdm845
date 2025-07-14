@@ -391,6 +391,7 @@ static int dsi_panel_gpio_release(struct dsi_panel *panel)
 	if (g_panel)
 		g_panel->panel_reset_skip = enable;
 }
+EXPORT_SYMBOL(drm_panel_reset_skip_enable);
 
  void drm_dsi_ulps_enable(bool enable)
 {
@@ -399,6 +400,7 @@ static int dsi_panel_gpio_release(struct dsi_panel *panel)
 		g_panel->ulps_suspend_enabled = enable;
 	}
 }
+EXPORT_SYMBOL(drm_dsi_ulps_enable);
 
 int dsi_panel_trigger_esd_attack(struct dsi_panel *panel)
 {
@@ -430,6 +432,7 @@ int dsi_panel_trigger_esd_attack(struct dsi_panel *panel)
 	if (g_panel)
 		g_panel->ulps_suspend_enabled = enable;
 }
+EXPORT_SYMBOL(drm_dsi_ulps_suspend_enable);
 
 static int dsi_panel_reset(struct dsi_panel *panel)
 {
