@@ -6,7 +6,7 @@
 #ifndef __STEP_CHG_H__
 #define __STEP_CHG_H__
 
-#define MAX_STEP_CHG_ENTRIES	8
+#define MAX_STEP_CHG_ENTRIES	5
 
 struct step_chg_jeita_param {
 	u32			psy_prop;
@@ -18,7 +18,7 @@ struct step_chg_jeita_param {
 struct range_data {
 	int low_threshold;
 	int high_threshold;
-	u32 value;
+	int value;
 };
 
 int qcom_step_chg_init(struct device *dev,
