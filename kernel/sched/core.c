@@ -831,7 +831,8 @@ static inline void uclamp_idle_reset(struct rq *rq, enum uclamp_id clamp_id,
 	if (!(rq->uclamp_flags & UCLAMP_FLAG_IDLE))
 		return;
 
-	WRITE_ONCE(rq->uclamp[clamp_id].value, clamp_value);
+	if (clamp_id == UCLAMP_MAX)
+		WRITE_ONCE(rq->uclamp[clamp_id].value, clamp_value);
 }
 
 static inline
