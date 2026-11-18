@@ -825,7 +825,6 @@ static void __arch_timer_setup(unsigned type,
 		arch_timer_check_ool_workaround(ate_match_local_cap_id, NULL);
 		arch_timer_check_858921_workaround();
 	} else {
-		clk->features |= CLOCK_EVT_FEAT_DYNIRQ;
 		clk->name = "arch_mem_timer";
 		clk->rating = 400;
 		clk->cpumask = cpu_possible_mask;
