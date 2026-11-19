@@ -187,10 +187,6 @@
 	status = "okay";
 };
 
-&wil6210 {
-	status = "ok";
-};
-
 &qcom_qbt1000 {
 	status = "disabled";
 };
