@@ -22,7 +22,7 @@
 
 #include "../../qcom/sdm845-sde-display.dtsi"
 #include "dipper-p0.dtsi"
-#include "../../qcom/sdm845-audio-overlay.dtsi"
+#include "dipper-audio-overlay.dtsi"
 #include "dipper-p0-pinctrl.dtsi"
 
 / {

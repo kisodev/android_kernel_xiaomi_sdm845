@@ -16,7 +16,7 @@
 
 #include "../../qcom/sdm845-v2.dtsi"
 #include "../../qcom/sdm845-sde-display.dtsi"
-#include "../../qcom/sdm845-audio-overlay.dtsi"
+#include "dipper-audio-overlay.dtsi"
 #include "dipper-p1-pinctrl.dtsi"
 #include "dipper-p1.dtsi"
 
