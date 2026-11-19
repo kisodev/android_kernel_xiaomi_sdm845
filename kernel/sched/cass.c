@@ -115,12 +115,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync)
 	bool has_idle = false;
 	int cidx = 0, cpu;
 
-	/*
-	 * Find the best CPU to wake @p on. Although idle_get_state() requires
-	 * an RCU read lock, an RCU read lock isn't needed because we're not
-	 * preemptible and RCU-sched is unified with normal RCU. Therefore,
-	 * non-preemptible contexts are implicitly RCU-safe.
-	 */
+	rcu_read_lock();
 	for_each_cpu_and(cpu, &p->cpus_allowed, cpu_active_mask) {
 		/* Use the free candidate slot for @curr */
 		struct cass_cpu_cand *curr = &cands[cidx];
@@ -205,6 +200,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync)
 			cidx ^= 1;
 		}
 	}
+	rcu_read_unlock();
 
 	return best->cpu;
 }
