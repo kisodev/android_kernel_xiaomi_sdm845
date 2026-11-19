@@ -1264,15 +1264,12 @@ static int sugov_init(struct cpufreq_policy *policy)
 	switch (policy->cpu) {
 	default:
 	case 0:
-		tunables->hispeed_freq = 1228800;
 		tunables->rtg_boost_freq = DEFAULT_CPU0_RTG_BOOST_FREQ;
 		break;
 	case 4:
-		tunables->hispeed_freq = 1459200;
 		tunables->rtg_boost_freq = DEFAULT_CPU4_RTG_BOOST_FREQ;
 		break;
 	case 7:
-		tunables->hispeed_freq = 1459200;
 		tunables->rtg_boost_freq = DEFAULT_CPU7_RTG_BOOST_FREQ;
 		break;
 	}
