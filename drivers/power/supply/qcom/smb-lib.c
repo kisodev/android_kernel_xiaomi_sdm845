@@ -3205,17 +3205,13 @@ int smblib_get_prop_usb_online(struct smb_charger *chg,
 	}
 
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
-	if (get_client_vote_locked(chg->usb_icl_votable, JEITA_VOTER) == 0) {
-		val->intval = true;
-		return rc;
-	}
-	if (chg->typec_en_dis_active) {
-		val->intval = 1;
-		return 0;
-	}
-	if (chg->ignore_recheck_flag) {
-		val->intval = 1;
-		return 0;
+	if (get_client_vote_locked(chg->usb_icl_votable, JEITA_VOTER) == 0 ||
+	    chg->typec_en_dis_active || chg->ignore_recheck_flag) {
+		rc = smblib_read(chg, USBIN_BASE + INT_RT_STS_OFFSET, &stat);
+		if (rc >= 0 && (stat & USBIN_PLUGIN_RT_STS_BIT)) {
+			val->intval = 1;
+			return 0;
+		}
 	}
 #endif
 	rc = smblib_read(chg, POWER_PATH_STATUS_REG, &stat);
@@ -3696,6 +3692,7 @@ int smblib_set_prop_type_recheck(struct smb_charger *chg,
 	if (val->intval == 0) {
 		cancel_delayed_work(&chg->charger_type_recheck);
 		chg->recheck_charger = false;
+		chg->recheck_count = 0;
 		chg->ignore_recheck_flag = false;
 	}
 	return 0;
@@ -4592,6 +4589,7 @@ void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 				vote(chg->awake_votable, CHG_AWAKE_VOTER, false, 0);
 				cancel_delayed_work(&chg->charger_type_recheck);
+				chg->recheck_count = 0;
 				chg->ignore_recheck_flag = false;
 #endif
 			}
@@ -4612,15 +4610,15 @@ static void smblib_wireless_set_enable(struct smb_charger *chg, int enable)
 {
 	int rc = 0;
 	union power_supply_propval val = {0, };
+	struct power_supply *idtp_psy = power_supply_get_by_name("idt");
 
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (chg->idtp_psy) {
+	if (idtp_psy) {
 		val.intval = enable;
-		rc = power_supply_set_property(chg->idtp_psy, POWER_SUPPLY_PROP_PIN_ENABLED, &val);
-		if (rc < 0) {
-			smblib_err(chg, "Could not set charger control limit =%d\n", rc);
-			return;
-		}
+		rc = power_supply_set_property(idtp_psy,
+				POWER_SUPPLY_PROP_PIN_ENABLED, &val);
+		if (rc < 0)
+			smblib_err(chg, "Could not set wireless pin enable rc=%d\n", rc);
+		power_supply_put(idtp_psy);
 	}
 }
 #endif
@@ -4677,7 +4675,7 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 		}
 		if (is_client_vote_enabled(chg->usb_icl_votable,
 							USB_PSY_VOTER)) {
-			vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
+			rc = vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
 			if (rc < 0)
 				smblib_err(chg, "Couldn't unvote USB_PSY rc=%d\n", rc);
 		}
@@ -4704,6 +4702,7 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 		cancel_delayed_work(&chg->typec_reenable_work);
 		cancel_delayed_work(&chg->charger_type_recheck);
+		chg->recheck_count = 0;
 		chg->ignore_recheck_flag = false;
 #endif
 		if (chg->fake_usb_insertion) {
@@ -4946,7 +4945,7 @@ int smblib_get_quick_charge_type(struct smb_charger *chg)
 	union power_supply_propval pval = {0, };
 
 	if (!chg) {
-		dev_err(chg->dev, "get quick charge type faied\n");
+		pr_err("get quick charge type failed\n");
 		return -EINVAL;
 	}
 
@@ -5250,17 +5249,15 @@ static void smblib_handle_apsd_done(struct smb_charger *chg, bool rising)
 #if defined(CONFIG_MACH_XIAOMI_SDM845) && defined(CONFIG_THERMAL)
 	val.intval = chg->system_temp_level;
 	rc = power_supply_set_property(chg->batt_psy, POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT, &val);
-	if (rc < 0) {
+	if (rc < 0)
 		smblib_err(chg, "Could not set charger control limit =%d\n", rc);
-		return;
-	}
 #endif
 
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 	if (chg->float_rerun_apsd) {
 		ret = smblib_get_prop_usb_present(chg, &pval);
 		if (ret < 0) {
-			smblib_err(chg, "Couldn't get usb present rc = %d\n", rc);
+			smblib_err(chg, "Couldn't get usb present rc = %d\n", ret);
 			return;
 		}
 		usb_present = pval.intval;
@@ -5874,6 +5871,7 @@ static void smblib_handle_typec_cc_state_change(struct smb_charger *chg)
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 		cancel_delayed_work(&chg->charger_type_recheck);
 		cancel_delayed_work(&chg->connector_health_work);
+		chg->recheck_count = 0;
 		chg->ignore_recheck_flag = false;
 #endif
 		chg->typec_present = false;
@@ -6015,37 +6013,42 @@ irqreturn_t smblib_handle_dc_plugin(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (stat & USBIN_PLUGIN_RT_STS_BIT) {
-		smblib_dbg(chg, PR_OEM, "DC plugin: %d\n", stat);
-		vote(chg->awake_votable, DC_AWAKE_VOTER, true, 0);
-		val.intval = true;
-		power_supply_set_property(chg->idtp_psy,
-				POWER_SUPPLY_PROP_PRESENT, &val);
-		val.intval = 1;
-		power_supply_set_property(chg->dc_psy,
-				POWER_SUPPLY_PROP_ONLINE, &val);
+	{
+		struct power_supply *idtp_psy = power_supply_get_by_name("idt");
+
+		if (stat & USBIN_PLUGIN_RT_STS_BIT) {
+			smblib_dbg(chg, PR_OEM, "DC plugin: %d\n", stat);
+			vote(chg->awake_votable, DC_AWAKE_VOTER, true, 0);
+			if (idtp_psy) {
+				val.intval = true;
+				power_supply_set_property(idtp_psy,
+						POWER_SUPPLY_PROP_PRESENT, &val);
+			}
+			val.intval = 1;
+			power_supply_set_property(chg->dc_psy,
+					POWER_SUPPLY_PROP_ONLINE, &val);
 #if defined(CONFIG_THERMAL)
-		val.intval = chg->dc_temp_level;
-		power_supply_set_property(chg->batt_psy, POWER_SUPPLY_PROP_DC_THERMAL_LEVELS, &val);
+			val.intval = chg->dc_temp_level;
+			power_supply_set_property(chg->batt_psy, POWER_SUPPLY_PROP_DC_THERMAL_LEVELS, &val);
 #endif
-	schedule_delayed_work(&chg->dc_input_current_work,
-			msecs_to_jiffies(2000));
-	}
-	else if (chg->idtp_psy) {
-		cancel_delayed_work_sync(&chg->dc_input_current_work);
-		val.intval = false;
-		power_supply_set_property(chg->idtp_psy,
-				POWER_SUPPLY_PROP_PRESENT, &val);
+			schedule_delayed_work(&chg->dc_input_current_work,
+					msecs_to_jiffies(2000));
+		} else if (idtp_psy) {
+			cancel_delayed_work_sync(&chg->dc_input_current_work);
+			val.intval = false;
+			power_supply_set_property(idtp_psy,
+					POWER_SUPPLY_PROP_PRESENT, &val);
 
-		val.intval = 0;
-		power_supply_set_property(chg->dc_psy,
-				POWER_SUPPLY_PROP_ONLINE, &val);
+			val.intval = 0;
+			power_supply_set_property(chg->dc_psy,
+					POWER_SUPPLY_PROP_ONLINE, &val);
 
-		vote(chg->awake_votable, DC_AWAKE_VOTER, false, 0);
-		vote(chg->dc_icl_votable, DCIN_ADAPTER_VOTER, true, 300000);
-		smblib_dbg(chg, PR_OEM, "DC plugout: %d\n", stat);
-
+			vote(chg->awake_votable, DC_AWAKE_VOTER, false, 0);
+			vote(chg->dc_icl_votable, DCIN_ADAPTER_VOTER, true, 300000);
+			smblib_dbg(chg, PR_OEM, "DC plugout: %d\n", stat);
+		}
+		if (idtp_psy)
+			power_supply_put(idtp_psy);
 	}
 #endif
 
@@ -6666,23 +6669,22 @@ static void smblib_charger_type_recheck(struct work_struct *work)
 	int rc, hvdcp;
 	u8 stat;
 	int recheck_time = TYPE_RECHECK_TIME_5S;
-	static int last_charger_type, check_count;
 
 	smblib_dbg(chg, PR_OEM, "typec_mode:%d,last:%d:real:%d\n",
-			chg->typec_mode, last_charger_type, chg->real_charger_type);
+			chg->typec_mode, chg->last_charger_type, chg->real_charger_type);
 
-	if (last_charger_type != chg->real_charger_type)
-		check_count--;
-	last_charger_type = chg->real_charger_type;
+	if (chg->last_charger_type != chg->real_charger_type && chg->recheck_count > 0)
+		chg->recheck_count--;
+	chg->last_charger_type = chg->real_charger_type;
 
 	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3 ||
-			chg->pd_active || (check_count >= TYPE_RECHECK_COUNT) ||
+			chg->pd_active || (chg->recheck_count >= TYPE_RECHECK_COUNT) ||
 			chg->check_vbus_once ||
 			((chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT)
 				&& (chg->typec_mode == POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER))) {
 		smblib_dbg(chg, PR_OEM, "hvdcp detect or check_count = %d break\n",
-				check_count);
-		check_count = 0;
+				chg->recheck_count);
+		chg->recheck_count = 0;
 		chg->ignore_recheck_flag = false;
 		return;
 	}
@@ -6704,11 +6706,13 @@ static void smblib_charger_type_recheck(struct work_struct *work)
 	rc = smblib_read(chg, APSD_STATUS_REG, &stat);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read APSD status rc=%d\n", rc);
+		chg->ignore_recheck_flag = false;
+		chg->recheck_count = 0;
 		return;
 	}
 	hvdcp = stat & QC_CHARGER_BIT;
 	smblib_dbg(chg, PR_OEM, "hvdcp:%d chg->legacy:%d check_count:%d\n",
-			hvdcp, chg->legacy, check_count);
+			hvdcp, chg->legacy, chg->recheck_count);
 	if (hvdcp && !chg->legacy) {
 		recheck_time = TYPE_RECHECK_TIME_20S;
 		__smblib_set_prop_pd_active(chg, 0);
@@ -6716,7 +6720,7 @@ static void smblib_charger_type_recheck(struct work_struct *work)
 		smblib_rerun_apsd_if_required(chg);
 
 check_next:
-	check_count++;
+	chg->recheck_count++;
 	schedule_delayed_work(&chg->charger_type_recheck, msecs_to_jiffies(recheck_time));
 }
 
@@ -7085,10 +7089,14 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_delayed_work_sync(&chg->uusb_otg_work);
 		cancel_delayed_work_sync(&chg->bb_removal_work);
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
+		cancel_delayed_work_sync(&chg->reg_work);
+		cancel_delayed_work_sync(&chg->monitor_low_temp_work);
+		cancel_delayed_work_sync(&chg->cc_float_charge_work);
 		cancel_delayed_work_sync(&chg->typec_reenable_work);
 		cancel_delayed_work_sync(&chg->charger_type_recheck);
 		cancel_delayed_work_sync(&chg->connector_health_work);
 		cancel_delayed_work_sync(&chg->dc_input_current_work);
+		chg->recheck_count = 0;
 		chg->ignore_recheck_flag = false;
 		cancel_delayed_work_sync(&chg->check_vbus_work);
 #endif

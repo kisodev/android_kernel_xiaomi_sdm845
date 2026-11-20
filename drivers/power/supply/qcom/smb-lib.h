@@ -510,6 +510,8 @@ struct smb_charger {
 	int			dc_adapter;
 	int			recheck_charger;
 	int			precheck_charger_type;
+	int			last_charger_type;
+	int			recheck_count;
 #endif
 };
 

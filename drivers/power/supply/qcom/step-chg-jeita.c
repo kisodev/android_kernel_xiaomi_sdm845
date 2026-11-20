@@ -717,16 +717,19 @@ static int handle_dynamic_fv(struct step_chg_info *chip)
 		goto update_time;
 	}
 
-	power_supply_get_property(chip->batt_psy,
-		POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
-	batt_vol = pval.intval;
-	if (batt_vol >= fv_uv){
-		goto update_time;
-	}
-
 	chip->fv_votable = find_votable("FV");
 	if (!chip->fv_votable)
 		goto update_time;
+
+	rc = power_supply_get_property(chip->batt_psy,
+		POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
+	batt_vol = pval.intval;
+	if (!rc && batt_vol >= fv_uv) {
+		int cur_fv = get_client_vote(chip->fv_votable, DYNAMIC_FV_VOTER);
+
+		if (cur_fv > 0 && fv_uv >= cur_fv)
+			goto update_time;
+	}
 
 	vote(chip->fv_votable, DYNAMIC_FV_VOTER, true, fv_uv);
 
@@ -941,6 +944,12 @@ static void status_change_work(struct work_struct *work)
 						false, 0);
 		}
 	}
+
+#if defined(CONFIG_MACH_XIAOMI_SDM845)
+	if (reschedule_dynamic_fv_work_us > 0)
+		schedule_delayed_work(&chip->status_change_work,
+				usecs_to_jiffies(reschedule_dynamic_fv_work_us));
+#endif
 
 exit_work:
 	__pm_relax(chip->step_chg_ws);

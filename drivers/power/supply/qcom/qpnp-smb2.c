@@ -1221,8 +1221,10 @@ static int smb2_set_wireless_dc_icl(struct smb_charger *chg,
 	if (val->intval) {
 		chg->dc_adapter = val->intval;
 		vote(chg->dc_icl_votable, DCIN_USER_VOTER, true, val->intval);
-	} else
-		vote(chg->dc_icl_votable, DCIN_ADAPTER_VOTER, false, 0);
+	} else {
+		chg->dc_adapter = 0;
+		vote(chg->dc_icl_votable, DCIN_USER_VOTER, false, 0);
+	}
 
 	return 0;
 }
@@ -1328,12 +1330,16 @@ static int smb2_get_prop_wireless_signal(struct smb_charger *chg,
 static int smb2_get_prop_wirless_type(struct smb_charger *chg,
 				union power_supply_propval *val)
 {
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (chg->idtp_psy)
-		power_supply_get_property(chg->idtp_psy,
-			POWER_SUPPLY_PROP_TX_ADAPTER, val);
+	struct power_supply *idtp_psy = power_supply_get_by_name("idt");
+	int rc = -EINVAL;
 
-	return 1;
+	if (idtp_psy) {
+		rc = power_supply_get_property(idtp_psy,
+			POWER_SUPPLY_PROP_TX_ADAPTER, val);
+		power_supply_put(idtp_psy);
+	}
+
+	return rc;
 }
 
 /*************************
