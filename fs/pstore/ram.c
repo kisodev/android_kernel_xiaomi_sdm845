@@ -749,7 +749,7 @@ static int ramoops_probe(struct platform_device *pdev)
 	 * Only a single ramoops area allowed at a time, so fail extra
 	 * probes.
 	 */
-	if (cxt->max_dump_cnt) {
+	if (cxt->size) {
 		pr_err("already initialized\n");
 		goto fail_out;
 	}
@@ -791,6 +791,11 @@ static int ramoops_probe(struct platform_device *pdev)
 
 	paddr = cxt->phys_addr;
 
+	if (cxt->console_size + cxt->ftrace_size + cxt->pmsg_size > cxt->size) {
+		pr_err("region sizes exceed mem_size\n");
+		err = -EINVAL;
+		goto fail_out;
+	}
 	dump_mem_sz = cxt->size - cxt->console_size - cxt->ftrace_size
 			- cxt->pmsg_size;
 	err = ramoops_init_przs("dump", dev, cxt, &cxt->dprzs, &paddr,
@@ -990,10 +995,19 @@ static int __init ramoops_memreserve(char *p)
 		return 1;
 
 	size = memparse(p, &p) & PAGE_MASK;
-	ramoops_data.mem_size = size;
+	if (!size)
+		return -EINVAL;
+
 	ramoops_data.mem_address = 0xB0000000;
+	if (memblock_reserve(ramoops_data.mem_address, size)) {
+		pr_err("failed to reserve ramoops memory\n");
+		return -ENOMEM;
+	}
+
+	ramoops_data.mem_size = size;
 	ramoops_data.console_size = size / 2;
-	ramoops_data.pmsg_size = size / 2;
+	ramoops_data.pmsg_size = size / 4;
+	ramoops_data.record_size = (size / 8 >= MIN_MEM_SIZE) ? size / 8 : 0;
 	ramoops_data.dump_oops = 1;
 
 	pr_info("msm_reserve_ramoops_memory addr=%llx,size=%lx\n",
@@ -1001,14 +1015,15 @@ static int __init ramoops_memreserve(char *p)
 	pr_info("msm_reserve_ramoops_memory record_size=%lx,ftrace_size=%lx\n",
 		ramoops_data.record_size, ramoops_data.ftrace_size);
 
-	memblock_reserve(ramoops_data.mem_address, ramoops_data.mem_size);
-
 	return 0;
 }
 early_param("ramoops_memreserve", ramoops_memreserve);
 
 static int __init msm_register_ramoops_device(void)
 {
+	if (!ramoops_data.mem_size)
+		return 0;
+
 	pr_info("msm_register_ramoops_device\n");
 	if (platform_device_register(&ramoops_dev))
 		pr_info("Unable to register ramoops platform device\n");
