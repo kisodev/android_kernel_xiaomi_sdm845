@@ -4648,8 +4648,9 @@ MODULE_PARM_DESC(pd_vbus_ctrl, "PD VBUS CONTROL");
 
 void pd_vbus_reset(struct usbpd *pd)
 {
-	if (!pd)
-	{
+	unsigned int delay_ms;
+
+	if (!pd) {
 		pr_err("pd_vbus_reset, pd is null\n");
 		return;
 	}
@@ -4658,13 +4659,11 @@ void pd_vbus_reset(struct usbpd *pd)
 		regulator_disable(pd->vbus);
 		pd->vbus_enabled = false;
 		stop_usb_host(pd);
-		pd_vbus_ctrl = 500;
-		msleep(pd_vbus_ctrl);
+		delay_ms = pd_vbus_ctrl ? pd_vbus_ctrl : 500;
+		msleep(delay_ms);
 		start_usb_host(pd, true);
 		enable_vbus(pd);
-	}
-	else
-	{
+	} else {
 		pr_err("pd_vbus is not enabled yet\n");
 	}
 }
@@ -4672,52 +4671,59 @@ void pd_vbus_reset(struct usbpd *pd)
 /* Handles VBUS off on */
 void usbpd_vbus_sm(struct work_struct *w)
 {
-	struct usbpd *pd = pd_lobal;
-	/* container_of(w, struct usbpd, vbus_work) */
+	struct usbpd *pd = container_of(w, struct usbpd, vbus_work.work);
 
 	pr_err("usbpd_vbus_sm handle state %s, vbus %d\n",
-			usbpd_state_strings[pd->current_state],pd->vbus_enabled);
+			usbpd_state_strings[pd->current_state], pd->vbus_enabled);
 
-	/* to be done, pd->sm_queued = false; */
 	pd_vbus_reset(pd);
+	pm_relax(&pd->dev);
 }
 
 void kick_usbpd_vbus_sm(void)
 {
+	if (!pd_lobal)
+		return;
+
 	pm_stay_awake(&pd_lobal->dev);
 
-	/* to be done pd_lobal->sm_queued = true;*/
 	pr_err("kick_usbpd_vbus_sm handle state %s, vbus %d\n",
-			usbpd_state_strings[pd_lobal->current_state],pd_lobal->vbus_enabled);
+			usbpd_state_strings[pd_lobal->current_state],
+			pd_lobal->vbus_enabled);
 
-	queue_delayed_work(pd_lobal->wq, &(pd_lobal->vbus_work), msecs_to_jiffies(200));
+	queue_delayed_work(pd_lobal->wq, &pd_lobal->vbus_work,
+			msecs_to_jiffies(200));
 }
 
 static ssize_t pd_vbus_show(struct device *dev, struct device_attribute *attr,
 		char *buf)
 {
 	struct usbpd *pd = dev_get_drvdata(dev);
-	pr_err("pd_vbus_show handle state %s, vbus %d\n",
-			usbpd_state_strings[pd_lobal->current_state],pd_lobal->vbus_enabled);
 
-	pd_vbus_reset(pd);
+	if (!pd)
+		return -ENODEV;
 
-	return 0;
+	return scnprintf(buf, PAGE_SIZE, "%d\n", pd->vbus_enabled);
 }
-
 
 static ssize_t pd_vbus_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
+	struct usbpd *pd = dev_get_drvdata(dev);
 	int val = 0;
 
-	if (sscanf(buf, "%d\n", &val) != 0)
-	{
-		pr_err("pd_vbus_store input err\n");
+	if (!pd)
+		return -ENODEV;
+
+	if (kstrtoint(buf, 0, &val) < 0)
+		return -EINVAL;
+
+	pr_err("pd_vbus_store handle state %s, vbus %d, val %d\n",
+			usbpd_state_strings[pd->current_state], pd->vbus_enabled, val);
+	if (val) {
+		pm_stay_awake(&pd->dev);
+		queue_delayed_work(pd->wq, &pd->vbus_work, msecs_to_jiffies(200));
 	}
-	pr_err("pd_vbus_store handle state %s, vbus %d,val %d\n",
-			usbpd_state_strings[pd_lobal->current_state],pd_lobal->vbus_enabled,val);
-	kick_usbpd_vbus_sm();
 
 	return size;
 }
@@ -5091,6 +5097,12 @@ void usbpd_destroy(struct usbpd *pd)
 
 	list_del(&pd->instance);
 	power_supply_unreg_notifier(&pd->psy_nb);
+#if defined(CONFIG_MACH_XIAOMI_SDM845)
+	cancel_delayed_work_sync(&pd->vbus_work);
+	pm_relax(&pd->dev);
+	if (pd_lobal == pd)
+		pd_lobal = NULL;
+#endif
 	power_supply_put(pd->usb_psy);
 	if (pd->bat_psy)
 		power_supply_put(pd->bat_psy);
