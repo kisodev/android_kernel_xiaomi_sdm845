@@ -795,6 +795,8 @@ struct mxt_data {
 
 	int finish_init;
 	int result_type;
+	struct proc_dir_entry *tp_selftest_proc;
+	struct proc_dir_entry *tp_lockdown_info_proc;
 };
 
 static struct mxt_data *g_mxt_data;
@@ -1993,9 +1995,10 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 	struct mxt_info cfg_info;
 	struct mxt_object *object;
 	const struct firmware *cfg = NULL;
-	int ret = 0, offset = 0, data_pos = 0, byte_offset = 0,i = 0, config_start_offset = 0, add_num = 0;
+	int ret = 0, offset = 0, data_pos = 0, byte_offset = 0, i = 0, config_start_offset = 0, add_num = 0;
 	u32 info_crc = 0, config_crc = 0;
 	u8 *config_mem = NULL;
+	char *cfg_buf = NULL;
 	size_t config_mem_size = 0;
 	unsigned int type = 0, instance = 0, size = 0;
 	u8 val = 0;
@@ -2007,9 +2010,23 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 		return 0;
 	}
 
+	if (cfg->size < strlen(MXT_CFG_MAGIC)) {
+		dev_err(dev, "Unrecognised config file\n");
+		ret = -EINVAL;
+		goto release;
+	}
+
+	cfg_buf = kmalloc(cfg->size + 1, GFP_KERNEL);
+	if (!cfg_buf) {
+		ret = -ENOMEM;
+		goto release;
+	}
+	memcpy(cfg_buf, cfg->data, cfg->size);
+	cfg_buf[cfg->size] = '\0';
+
 	mxt_read_current_crc(data);
 
-	if (strncmp(cfg->data, MXT_CFG_MAGIC, strlen(MXT_CFG_MAGIC))) {
+	if (strncmp(cfg_buf, MXT_CFG_MAGIC, strlen(MXT_CFG_MAGIC))) {
 		dev_err(dev, "Unrecognised config file\n");
 		ret = -EINVAL;
 		goto release;
@@ -2019,29 +2036,27 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 
 	/* Load information block and check */
 	for (i = 0; i < sizeof(struct mxt_info); i++) {
-		ret = sscanf(cfg->data + data_pos, "%hhx%n",
-			     (unsigned char *)&cfg_info + i,
-			     &offset);
-		if (ret != 1) {
+		if (data_pos >= cfg->size ||
+		    sscanf(cfg_buf + data_pos, "%hhx%n",
+			   (unsigned char *)&cfg_info + i, &offset) != 1) {
 			dev_err(dev, "Bad format\n");
 			ret = -EINVAL;
 			goto release;
 		}
-
 		data_pos += offset;
 	}
 
 	/* Read CRCs */
-	ret = sscanf(cfg->data + data_pos, "%x%n", &info_crc, &offset);
-	if (ret != 1) {
+	if (data_pos >= cfg->size ||
+	    sscanf(cfg_buf + data_pos, "%x%n", &info_crc, &offset) != 1) {
 		dev_err(dev, "Bad format\n");
 		ret = -EINVAL;
 		goto release;
 	}
 	data_pos += offset;
 
-	ret = sscanf(cfg->data + data_pos, "%x%n", &config_crc, &offset);
-	if (ret != 1) {
+	if (data_pos >= cfg->size ||
+	    sscanf(cfg_buf + data_pos, "%x%n", &config_crc, &offset) != 1) {
 		dev_err(dev, "Bad format\n");
 		ret = -EINVAL;
 		goto release;
@@ -2071,6 +2086,10 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 	/* Malloc memory to store configuration */
 	config_start_offset = MXT_OBJECT_START
 		+ data->info.object_num * MXT_OBJECT_SIZE;
+	if (data->mem_size <= config_start_offset) {
+		ret = -EINVAL;
+		goto release;
+	}
 	config_mem_size = data->mem_size - config_start_offset;
 	config_mem = kzalloc(config_mem_size, GFP_KERNEL);
 	if (!config_mem) {
@@ -2081,7 +2100,7 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 
 	while (data_pos < cfg->size) {
 		/* Read type, instance, length */
-		ret = sscanf(cfg->data + data_pos, "%x %x %x%n",
+		ret = sscanf(cfg_buf + data_pos, "%x %x %x%n",
 			     &type, &instance, &size, &offset);
 		if (ret == 0) {
 			/* EOF */
@@ -2137,10 +2156,8 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 		}
 
 		for (i = 0; i < size; i++) {
-			ret = sscanf(cfg->data + data_pos, "%hhx%n",
-					&val,
-					&offset);
-			if (ret != 1) {
+			if (data_pos >= cfg->size ||
+			    sscanf(cfg_buf + data_pos, "%hhx%n", &val, &offset) != 1) {
 				dev_err(dev, "Bad format\n");
 				ret = -EINVAL;
 				goto release_mem;
@@ -2149,7 +2166,7 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 			byte_offset = reg + i - config_start_offset;
 
 			if ((byte_offset >= 0)
-				&& (byte_offset <= config_mem_size)) {
+				&& (byte_offset < config_mem_size)) {
 				*(config_mem + byte_offset) = val;
 			} else {
 				dev_err(dev, "Bad object: reg:%d, T%d, ofs=%d\n",
@@ -2195,6 +2212,7 @@ static int mxt_download_config(struct mxt_data *data, const char *fn)
 release_mem:
 	kfree(config_mem);
 release:
+	kfree(cfg_buf);
 	release_firmware(cfg);
 	return ret;
 }
@@ -2546,7 +2564,6 @@ static int mxt_check_reg_init(struct mxt_data *data)
 	int ret = 0;
 	const char *config_name = NULL;
 	bool is_recheck = false, use_default_cfg = false;
-	u8 *tp_maker = NULL;
 
 	if (data->firmware_updated)
 		use_default_cfg = true;
@@ -2621,10 +2638,6 @@ start:
 		}
 	}
 
-	tp_maker = kzalloc(20, GFP_KERNEL);
-	if (tp_maker == NULL)
-		dev_err(dev, "fail to alloc vendor name memory\n");
-
 	config_name = mxt_get_config(data, use_default_cfg);
 
 	if (data->config_info[0] >= 0x65) {
@@ -2693,18 +2706,27 @@ static int mxt_get_object_table(struct mxt_data *data)
 	int i;
 	u16 end_address;
 	u8 reportid = 0;
-	u8 buf[data->info.object_num][MXT_OBJECT_SIZE];
+	u8 (*buf)[MXT_OBJECT_SIZE] = NULL;
 	int add_num = 0;
 	data->mem_size = 0;
+
+	if (!data->info.object_num)
+		return -EINVAL;
+
+	buf = kcalloc(data->info.object_num, MXT_OBJECT_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 
 	data->object_table = kcalloc(data->info.object_num,
 				     sizeof(struct mxt_object), GFP_KERNEL);
 	if (!data->object_table) {
 		dev_err(dev, "Failed to allocate object table\n");
+		kfree(buf);
 		return -ENOMEM;
 	}
 
-	ret = mxt_read_reg(client, MXT_OBJECT_START, sizeof(buf), buf);
+	ret = mxt_read_reg(client, MXT_OBJECT_START,
+			   data->info.object_num * MXT_OBJECT_SIZE, buf);
 	if (ret)
 		goto free_object_table;
 
@@ -2825,6 +2847,9 @@ static int mxt_get_object_table(struct mxt_data *data)
 			object->min_reportid, object->max_reportid);
 	}
 
+	kfree(buf);
+	buf = NULL;
+
 	/* Store maximum reportid */
 	data->max_reportid = reportid;
 
@@ -2846,7 +2871,9 @@ static int mxt_get_object_table(struct mxt_data *data)
 	return 0;
 
 free_object_table:
+	kfree(buf);
 	kfree(data->object_table);
+	data->object_table = NULL;
 	return ret;
 }
 
@@ -2995,7 +3022,7 @@ static int mxt_configure_regulator(struct mxt_data *data, bool enabled)
 		if (ret < 0) {
 			dev_err(&client->dev,
 				"regulator_set_voltage for vdd failed: %d\n", ret);
-			return ret;
+			goto err_put_regulator_vdd;
 		}
 	}
 
@@ -3012,6 +3039,7 @@ err_put_regulator_vdd:
 	devm_regulator_put(data->regulator_vdd);
 err_null_regulator_vdd:
 	data->regulator_vdd = NULL;
+	regulator_disable(data->regulator_vddio);
 err_put_regulator_vddio:
 	devm_regulator_put(data->regulator_vddio);
 err_null_regulator_vddio:
@@ -3019,10 +3047,16 @@ err_null_regulator_vddio:
 	return ret;
 
 disable_regulator:
-	regulator_disable(data->regulator_vddio);
-	regulator_disable(data->regulator_vdd);
-	devm_regulator_put(data->regulator_vddio);
-	devm_regulator_put(data->regulator_vdd);
+	if (data->regulator_vddio) {
+		regulator_disable(data->regulator_vddio);
+		devm_regulator_put(data->regulator_vddio);
+		data->regulator_vddio = NULL;
+	}
+	if (data->regulator_vdd) {
+		regulator_disable(data->regulator_vdd);
+		devm_regulator_put(data->regulator_vdd);
+		data->regulator_vdd = NULL;
+	}
 	return 0;
 }
 
@@ -3203,7 +3237,9 @@ retry_probe:
 				data->state = BOOTLOADER;
 				/* this is not an error state, we can reflash
 				 * from here */
-				 error = mxt_update_firmware(&client->dev, NULL,
+				if (!data->pdata->mxt_fw_name)
+					return -EINVAL;
+				error = mxt_update_firmware(&client->dev, NULL,
 						data->pdata->mxt_fw_name,
 						strlen(data->pdata->mxt_fw_name),
 						&data->firmware_updated);
@@ -3294,7 +3330,7 @@ static int strtobyte(const char *data, u8 *value)
 	return kstrtou8(str, 16, value);
 }
 
-static size_t mxt_convert_text_to_binary(u8 *buffer, size_t len)
+static ssize_t mxt_convert_text_to_binary(u8 *buffer, size_t len)
 {
 	int ret;
 	int i;
@@ -3308,7 +3344,7 @@ static size_t mxt_convert_text_to_binary(u8 *buffer, size_t len)
 		j++;
 	}
 
-	return (size_t)j;
+	return j;
 }
 
 static int mxt_check_firmware_format(struct device *dev, const struct firmware *fw)
@@ -3357,7 +3393,7 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 	unsigned int frame= 0;
 	int ret;
 	unsigned short ori_addr = data->client->addr;
-	size_t len = 0;
+	ssize_t len = 0;
 	u8 *buffer;
 
 	ret = request_firmware(&fw, fn, dev);
@@ -3366,20 +3402,28 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 		return ret;
 	}
 
-	buffer = kmalloc(fw->size ,GFP_KERNEL);
+	if (fw->size == 0) {
+		release_firmware(fw);
+		return -EINVAL;
+	}
+
+	buffer = kmalloc(fw->size, GFP_KERNEL);
 	if (!buffer) {
 		dev_err(dev, "malloc firmware buffer failed!\n");
+		release_firmware(fw);
 		return -ENOMEM;
 	}
 	memcpy(buffer, fw->data, fw->size);
 	len = fw->size;
 
-	ret  = mxt_check_firmware_format(dev, fw);
+	ret = mxt_check_firmware_format(dev, fw);
 	if (ret) {
 		dev_info(dev, "text format, convert it to binary!\n");
 		len = mxt_convert_text_to_binary(buffer, len);
-		if (len <= 0)
+		if (len <= 0) {
+			ret = -EINVAL;
 			goto release_firmware;
+		}
 	}
 
 
@@ -3425,13 +3469,23 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 			goto release_firmware;
 		}
 
+		if (pos + 1 >= len) {
+			ret = -EINVAL;
+			data->state = FAILED;
+			goto release_firmware;
+		}
 		frame_size = ((*(buffer + pos) << 8) | *(buffer + pos + 1));
 
 		/* Take account of CRC bytes */
 		frame_size += 2;
+		if (frame_size > len - pos) {
+			ret = -EINVAL;
+			data->state = FAILED;
+			goto release_firmware;
+		}
 
 		/* Write one frame to device */
-		ret = mxt_bootloader_write(data,buffer + pos, frame_size);
+		ret = mxt_bootloader_write(data, buffer + pos, frame_size);
 		if (ret) {
 			data->state = FAILED;
 			goto release_firmware;
@@ -3441,7 +3495,7 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 		ret = mxt_check_bootloader(data, MXT_FRAME_CRC_PASS);
 
 		if (ret) {
-			retry ++;
+			retry++;
 
 			/* Back off by 20ms per retry */
 			msleep(retry * 20);
@@ -3451,9 +3505,9 @@ static int mxt_load_fw(struct device *dev, const char *fn)
 				goto release_firmware;
 			}
 		} else {
-				retry ++;
-				pos += frame_size;
-				frame ++;
+			retry = 0;
+			pos += frame_size;
+			frame++;
 		}
 
 		if (frame % 10 == 0) {
@@ -3524,9 +3578,7 @@ static ssize_t mxt_update_firmware(struct device *dev,
 		mxt_initialize(data);
 	}
 
-	if (data->state == APPMODE) {
-		mxt_enable_irq(data);
-	}
+	mxt_enable_irq(data);
 
 	kfree(fw_name);
 	return count;
@@ -3887,11 +3939,13 @@ static void mxt_self_tuning_work(struct work_struct *work)
 	struct mxt_data *data = container_of(work, struct mxt_data, self_tuning_work);
 
 	if (data->rev_id == REV_D) {
-		do {
+		int retry;
+
+		for (retry = 0; retry < 10; retry++) {
 			mxt_self_tune(data, MXT_SELFCMD_STCR_TUNE);
 			if (mxt_self_tune_pass(data, false))
 				break;
-		} while (1);
+		}
 	}
 }
 
@@ -3999,7 +4053,9 @@ static ssize_t mxt_selftest_store(struct device *dev,
 			MXT_SPT_SELFTEST_T25,
 			0x01, 0xfe);
 	if (!error) {
-		while (true) {
+		int retry;
+
+		for (retry = 0; retry < 500; retry++) {
 			msleep(10);
 			error = mxt_read_object(data,
 					MXT_SPT_SELFTEST_T25,
@@ -4007,6 +4063,8 @@ static ssize_t mxt_selftest_store(struct device *dev,
 			if (error || selftest_cmd == 0)
 				break;
 		}
+		if (!error && selftest_cmd != 0)
+			error = -ETIMEDOUT;
 	}
 	error = mxt_set_clr_reg(data, MXT_PROCG_NOISESUPPRESSION_T72,
 			MXT_NOISESUP_STABCTRL, dualxmode_val, MXT_STABCTRL_DUALXMODE);
@@ -4657,7 +4715,7 @@ static ssize_t mxt_mutual_ref_show(struct device *dev,
 	int ret, i, j, chan_x, chan_y, max_nodes;
 	u8 x_size, y_size;
 	u16 *ref_buf;
-	ssize_t count;
+	ssize_t count = 0;
 
 	if (data->info.family_id == 0xA4 && data->info.variant_id == 0x15) {
 		/* MXT336T */
@@ -4670,29 +4728,29 @@ static ssize_t mxt_mutual_ref_show(struct device *dev,
 		max_nodes = chan_x * chan_y;
 	}
 
-	ref_buf = kzalloc(max_nodes * sizeof(u16), GFP_KERNEL);
-	if (!ref_buf) {
-		count = snprintf(buf, PAGE_SIZE, "Error allocating memory\n");
-		return count;
-	}
+	if (max_nodes <= 0)
+		return scnprintf(buf, PAGE_SIZE, "Invalid matrix size\n");
+
+	ref_buf = kcalloc(max_nodes, sizeof(u16), GFP_KERNEL);
+	if (!ref_buf)
+		return scnprintf(buf, PAGE_SIZE, "Error allocating memory\n");
 
 	ret = mxt_do_diagnostic_test(data, MXT_DIAG_MUTUAL_REF,
 			max_nodes * sizeof(u16), (u8 *)ref_buf);
 	if (ret < 0) {
-		count = snprintf(buf, PAGE_SIZE, "Error getting mutual cap references\n");
-		kfree(ref_buf);
-		return count;
+		count = scnprintf(buf, PAGE_SIZE, "Error getting mutual cap references\n");
+		goto free_buf;
 	}
-	ret = mxt_read_object(g_mxt_data, MXT_TOUCH_MULTI_T100, MXT_MULTITOUCH_XSIZE, &x_size);
+	ret = mxt_read_object(data, MXT_TOUCH_MULTI_T100, MXT_MULTITOUCH_XSIZE, &x_size);
 	if (ret) {
-		count = snprintf(buf, PAGE_SIZE, "Error get xsize\n");
-		return count;
+		count = scnprintf(buf, PAGE_SIZE, "Error get xsize\n");
+		goto free_buf;
 	}
 
-	ret = mxt_read_object(g_mxt_data, MXT_TOUCH_MULTI_T100, MXT_MULTITOUCH_YSIZE, &y_size);
+	ret = mxt_read_object(data, MXT_TOUCH_MULTI_T100, MXT_MULTITOUCH_YSIZE, &y_size);
 	if (ret) {
-		count = snprintf(buf, PAGE_SIZE, "Error get ysize\n");
-		return count;
+		count = scnprintf(buf, PAGE_SIZE, "Error get ysize\n");
+		goto free_buf;
 	}
 	pr_info("mxt:x_size:%d,y_size:%d,x_chan:%d,y_chsn:%d\n", x_size, y_size, chan_x, chan_y);
 
@@ -4700,14 +4758,13 @@ static ssize_t mxt_mutual_ref_show(struct device *dev,
 		for (j = 0; j < chan_y; j++) {
 			if (i >= x_size || j >= y_size)
 				continue;
-			snprintf(buf, PAGE_SIZE, "%s%d ",
-				buf, (short)ref_buf[i * chan_y + j]);
+			count += scnprintf(buf + count, PAGE_SIZE - count, "%d ",
+					   (short)ref_buf[i * chan_y + j]);
 		}
-		strlcat(buf, "\n", PAGE_SIZE);
+		count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
 	}
 
-	count = strlen(buf);
-
+free_buf:
 	kfree(ref_buf);
 	return count;
 }
@@ -4716,56 +4773,51 @@ static ssize_t mxt_self_ref_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
-	int ret, i, chan_x, chan_y, max_nodes, even_x_start, odd_x_start;
+	int ret, i, chan_x, chan_y, even_x_start, odd_x_start;
 	u16 *ref_buf;
-	ssize_t count;
+	ssize_t count = 0;
 
 	if (data->info.family_id == 0xA4 && data->info.variant_id == 0x15) {
 		/* MXT336T */
 		chan_x = MXT_336T_CHANNELS_X;
 		chan_y = MXT_336T_CHANNELS_Y;
-		max_nodes = MXT_336T_MAX_NODES;
 		even_x_start = MXT_336T_CHANNELS_Y;
 		odd_x_start = MXT_336T_CHANNELS_Y +
 			MXT_336T_CHANNELS_X / 2 +
 			MXT_336T_X_SELFREF_RESERVED;
+	} else {
+		return scnprintf(buf, PAGE_SIZE, "Unsupported device\n");
 	}
 
-	ref_buf = kzalloc(MXT_DIAG_PAGE_SIZE * sizeof(u8), GFP_KERNEL);
-	if (!ref_buf) {
-		count = snprintf(buf, PAGE_SIZE, "Error allocating memory\n");
-		return count;
-	}
+	ref_buf = kzalloc(MXT_DIAG_PAGE_SIZE, GFP_KERNEL);
+	if (!ref_buf)
+		return scnprintf(buf, PAGE_SIZE, "Error allocating memory\n");
 
 	ret = mxt_do_diagnostic_test(data, MXT_DIAG_SELF_REF,
-			MXT_DIAG_PAGE_SIZE * sizeof(u8), (u8 *)ref_buf);
+			MXT_DIAG_PAGE_SIZE, (u8 *)ref_buf);
 	if (ret < 0) {
-		count = snprintf(buf, PAGE_SIZE, "Error getting self cap references\n");
 		kfree(ref_buf);
-		return count;
+		return scnprintf(buf, PAGE_SIZE, "Error getting self cap references\n");
 	}
 
 	/* Self cap ref for Y channels */
 	for (i = 0; i < chan_y; i++)
-		snprintf(buf, PAGE_SIZE, "%s%d ", buf, ref_buf[i]);
-	strncat(buf, "\n", PAGE_SIZE);
+		count += scnprintf(buf + count, PAGE_SIZE - count, "%d ", ref_buf[i]);
+	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
 
 	/* Self cap ref for X channels */
 	for (i = 0; i < chan_x; i++) {
 		if (i & 0x01) {
 			/* Self ref data from odd x array */
-			snprintf(buf, PAGE_SIZE, "%s%d ",
-				buf, ref_buf[odd_x_start + (i - 1) / 2]);
+			count += scnprintf(buf + count, PAGE_SIZE - count, "%d ",
+					   ref_buf[odd_x_start + (i - 1) / 2]);
 		} else {
 			/* Self ref data from even x array */
-			snprintf(buf, PAGE_SIZE, "%s%d ",
-				buf, ref_buf[even_x_start + i / 2]);
+			count += scnprintf(buf + count, PAGE_SIZE - count, "%d ",
+					   ref_buf[even_x_start + i / 2]);
 		}
-
 	}
-	strncat(buf, "\n", PAGE_SIZE);
-
-	count = strlen(buf);
+	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
 
 	kfree(ref_buf);
 	return count;
@@ -4774,6 +4826,7 @@ static ssize_t mxt_self_ref_show(struct device *dev,
 static int mxt_chip_reset(struct mxt_data *data)
 {
 	int error = 0;
+
 	mxt_disable_irq(data);
 	gpio_set_value(data->pdata->reset_gpio, 0);
 	msleep(20);
@@ -4781,13 +4834,18 @@ static int mxt_chip_reset(struct mxt_data *data)
 
 	msleep(10);
 	mxt_wait_for_chg(data);
-	mxt_enable_irq(data);
 	error = mxt_soft_reset(data, MXT_RESET_VALUE);
-	if (error)
+	if (error) {
+		mxt_enable_irq(data);
 		return error;
+	}
 
+	kfree(data->object_table);
+	data->object_table = NULL;
+	kfree(data->msg_buf);
+	data->msg_buf = NULL;
 	error = mxt_initialize(data);
-
+	mxt_enable_irq(data);
 	return error;
 }
 
@@ -4795,17 +4853,19 @@ static ssize_t mxt_edge_suppression_enable_show(struct device *dev,
 			struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
-	int count;
+	int count = -EINVAL;
 	u8 val = 0;
 	int error = 0;
 
 	error = mxt_read_object(data, MXT_PROCI_GRIP_T40, MXT_PROCI_GRIP_CTRL, &val);
-	if (!error) {
-		if (val == 0x59)
-			count = snprintf(buf, PAGE_SIZE, "1\n");
-		if (val == 0)
-			count = snprintf(buf, PAGE_SIZE, "0\n");
-	}
+	if (error)
+		return error;
+
+	if (val == 0x59)
+		count = snprintf(buf, PAGE_SIZE, "1\n");
+	else if (val == 0)
+		count = snprintf(buf, PAGE_SIZE, "0\n");
+
 	return count;
 }
 
@@ -4848,10 +4908,10 @@ static ssize_t mxt_irq_enable_store(struct device *dev,
 
 	error = kstrtoul(buf, 0, &val);
 	if (!error) {
-	if (!val)
-		disable_irq(data->irq);
-	else
-		enable_irq(data->irq);
+		if (!val)
+			mxt_disable_irq(data);
+		else
+			mxt_enable_irq(data);
 	}
 
 	return error ? : count;
@@ -5683,15 +5743,23 @@ static ssize_t mxt_debugfs_object_store(struct file *file,
 {
 	struct seq_file *m = file->private_data;
 	struct mxt_data *data = m->private;
+	char kbuf[32];
 	u8 type, offset, val;
 	int error = 0;
 
-	if (sscanf(buf, "%hhu:%hhu=%hhx", &type, &offset, &val) == 3) {
+	if (count == 0 || count >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+	kbuf[count] = '\0';
+
+	if (sscanf(kbuf, "%hhu:%hhu=%hhx", &type, &offset, &val) == 3) {
 		error = mxt_write_object(data, type, offset, val);
 		if (error)
-			count = error;
-	} else
-		count = -EINVAL;
+			return error;
+	} else {
+		return -EINVAL;
+	}
 
 	return count;
 }
@@ -5780,6 +5848,7 @@ static void mxt_dump_value(struct device *dev, struct mxt_platform_data *pdata)
 static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 {
 	int ret;
+	size_t count = 0;
 	struct mxt_config_info *info;
 	struct device_node *temp, *np = dev->of_node;
 	struct property *prop;
@@ -5859,54 +5928,58 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 	info = pdata->config_array;
 
 	for_each_child_of_node(np, temp) {
+		if (count >= pdata->config_array_size) {
+			of_node_put(temp);
+			break;
+		}
 		ret = of_property_read_u32(temp, "atmel,family-id", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read family id\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->family_id = (u8)temp_val;
 		ret = of_property_read_u32(temp, "atmel,variant-id", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read variant id\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->variant_id = (u8)temp_val;
 		ret = of_property_read_u32(temp, "atmel,version", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read version\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->version = (u8)temp_val;
 		ret = of_property_read_u32(temp, "atmel,build", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read build\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->build = (u8)temp_val;
 		ret = of_property_read_string(temp, "atmel,mxt-cfg-name",
 			&info->mxt_cfg_name);
 		if (ret && (ret != -EINVAL)) {
 			dev_err(dev, "Unable to read cfg name\n");
-			return ret;
+			goto err_put_node;
 		}
 		ret = of_property_read_u32(temp, "atmel,vendor-id", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read vendor id\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->vendor_id = (u8)temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,panel-id", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read panel id\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->panel_id = (u8)temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,rev-id", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read rev id\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->rev_id = (u8)temp_val;
 
@@ -5916,124 +5989,126 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 			info->key_codes = devm_kzalloc(dev,
 					sizeof(int) * info->key_num,
 					GFP_KERNEL);
-			if (!info->key_codes)
-				return -ENOMEM;
+			if (!info->key_codes) {
+				ret = -ENOMEM;
+				goto err_put_node;
+			}
 			ret = of_property_read_u32_array(temp, "atmel,key-codes",
 					info->key_codes, info->key_num);
 			if (ret) {
 				dev_err(dev, "Unable to read key codes\n");
-				return ret;
+				goto err_put_node;
 			}
 		}
 
 		ret = of_property_read_u32(temp, "atmel,selfintthr-stylus", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read selfintthr-stylus\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->selfintthr_stylus = temp_val;
 		ret = of_property_read_u32(temp, "atmel,t71-tchthr-pos", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t71-glove-ctrl-reg\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->t71_tchthr_pos = temp_val;
 		ret = of_property_read_u32(temp, "atmel,self-chgtime-min", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read self-chgtime-min\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->self_chgtime_min = temp_val;
 		ret = of_property_read_u32(temp, "atmel,self-chgtime-max", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read self-chgtime-max\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->self_chgtime_max = temp_val;
 		ret = of_property_read_u32(temp, "atmel,mult-intthr-sensitive", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read mult-intthr-sensitive\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->mult_intthr_sensitive = temp_val;
 		ret = of_property_read_u32(temp, "atmel,mult-intthr-not-sensitive", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read mult-intthr-not-sensitive\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->mult_intthr_not_sensitive = temp_val;
 		ret = of_property_read_u32(temp, "atmel,atchthr-sensitive", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read mult-intthr-not-sensitive\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->atchthr_sensitive = temp_val;
 		ret = of_property_read_u32(temp, "atmel,mult-tchthr-sensitive", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read mult-tchthr-sensitive\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->mult_tchthr_sensitive = temp_val;
 		ret = of_property_read_u32(temp, "atmel,mult-tchthr-not-sensitive", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read mult-tchthr-not-sensitive\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->mult_tchthr_not_sensitive = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,wake-up-self-adcx", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read wake-up-self-adcx\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->wake_up_self_adcx = (u8)temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,atchratio", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 atchratio\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->atchratio = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,xycfg", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 xycfg\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->xycfg = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,xsize", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 xsize\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->xsize = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,xrange-lsb", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 xrange lsb\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->xrange_lsb = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,xrange-msb", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 xrange msb\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->xrange_msb = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,tchhyst", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 tchhyst\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->tchhyst = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,intthrhyst", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t100 intthrhyst\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->intthrhyst = temp_val;
 
@@ -6041,51 +6116,56 @@ static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
 		ret = of_property_read_u32(temp, "atmel,xtchthr", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t104 xtchthr\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->xtchthr = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,xtchhyst", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t104 xtchhyst\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->xtchhyst = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,intthrx", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t104 intthrx\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->intthrx = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,ytchthr", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t104 ytchthr\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->ytchthr = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,ytchhyst", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t104 ytchhyst\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->ytchhyst = temp_val;
 
 		ret = of_property_read_u32(temp, "atmel,intthry", &temp_val);
 		if (ret) {
 			dev_err(dev, "Unable to read t104 intthry\n");
-			return ret;
+			goto err_put_node;
 		} else
 			info->intthry = temp_val;
 
 		info++;
+		count++;
 	}
 
 	mxt_dump_value(dev, pdata);
 
 	return 0;
+
+err_put_node:
+	of_node_put(temp);
+	return ret;
 }
 #else
 static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
@@ -6337,7 +6417,9 @@ static ssize_t short_test(void)
 			MXT_SPT_SELFTEST_T25,
 			0x01, 0x12);
 	if (!retval) {
-		while (true) {
+		int retry;
+
+		for (retry = 0; retry < 500; retry++) {
 			msleep(10);
 			retval = mxt_read_object(g_mxt_data,
 					MXT_SPT_SELFTEST_T25,
@@ -6345,8 +6427,11 @@ static ssize_t short_test(void)
 			if (retval || selftest_cmd == 0)
 				break;
 		}
-	} else
+		if (!retval && selftest_cmd != 0)
+			retval = -ETIMEDOUT;
+	} else {
 		retval = -EINVAL;
+	}
 
 	mxt_set_clr_reg(g_mxt_data, MXT_PROCG_NOISESUPPRESSION_T72, MXT_NOISESUP_STABCTRL, dualxmode_val, MXT_STABCTRL_DUALXMODE);
 
@@ -6430,21 +6515,23 @@ static ssize_t open_test(void)
 	g_mxt_data->result_type = TEST_OK;
 
 out:
-	retval = mxt_write_object(g_mxt_data, MXT_SPT_CTECONFIG_T46, 0, 0);
-	if (retval) {
-		dev_err(&g_mxt_data->client->dev, "write to t46 byte0 to 0 failed!\n");
+	if (g_mxt_data) {
+		int cleanup_ret = mxt_write_object(g_mxt_data, MXT_SPT_CTECONFIG_T46, 0, 0);
+		if (cleanup_ret) {
+			dev_err(&g_mxt_data->client->dev, "write to t46 byte0 to 0 failed!\n");
+			if (retval >= 0)
+				retval = cleanup_ret;
+		}
+		/* Backup to memory */
+		mxt_write_object(g_mxt_data, MXT_GEN_COMMAND_T6, MXT_COMMAND_BACKUPNV, MXT_BACKUP_VALUE);
+		msleep(MXT_BACKUP_TIME);
+		/* reset */
+		mxt_soft_reset(g_mxt_data, MXT_RESET_VALUE);
+		if (retval < 0)
+			g_mxt_data->result_type = TEST_INVALID;
 	}
-	/* Backup to memory */
-	mxt_write_object(g_mxt_data, MXT_GEN_COMMAND_T6, MXT_COMMAND_BACKUPNV, MXT_BACKUP_VALUE);
-	msleep(MXT_BACKUP_TIME);
-	/* reset */
-	mxt_soft_reset(g_mxt_data, MXT_RESET_VALUE);
-	if (ref_buf) {
-		kfree(ref_buf);
-		ref_buf = NULL;
-	}
-	if (retval < 0)
-		g_mxt_data->result_type = TEST_INVALID;
+	kfree(ref_buf);
+	ref_buf = NULL;
 
 	return retval;
 }
@@ -6480,44 +6567,38 @@ static int mxt_selftest_open(struct inode *inode, struct file *file)
 
 static ssize_t mxt_selftest_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
-	char tmp[5] = { 0 };
+	char tmp[16];
+	int len;
 
-	if (*pos != 0 && g_mxt_data)
-		return 0;
+	if (!g_mxt_data)
+		return -ENODEV;
 
-	snprintf(tmp, sizeof(g_mxt_data->result_type), "%d", g_mxt_data->result_type);
-	if (copy_to_user(buf, tmp, strlen(tmp))) {
-		return -EFAULT;
-	}
-
-	*pos += strlen(tmp);
-
-	return strlen(tmp);
+	len = scnprintf(tmp, sizeof(tmp), "%d\n", g_mxt_data->result_type);
+	return simple_read_from_buffer(buf, count, pos, tmp, len);
 }
 
 static ssize_t mxt_selftest_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
 {
 	int retval = 0;
-	char tmp[6];
+	char tmp[8];
 
-	if (copy_from_user(tmp, buf, count)) {
-		retval = -EFAULT;
-		goto out;
-	}
+	if (!g_mxt_data)
+		return -ENODEV;
+	if (count == 0 || count >= sizeof(tmp))
+		return -EINVAL;
 
-	if (!strncmp(tmp, "short", 5)) {
+	memset(tmp, 0, sizeof(tmp));
+	if (copy_from_user(tmp, buf, count))
+		return -EFAULT;
+
+	if (!strncmp(tmp, "short", 5))
 		retval = short_test();
-	} else if (!strncmp(tmp, "open", 4)) {
+	else if (!strncmp(tmp, "open", 4))
 		retval = open_test();
-	} else if (!strncmp(tmp, "i2c", 3)) {
+	else if (!strncmp(tmp, "i2c", 3))
 		retval = i2c_test();
-	}
-out:
 
-	if (retval >= 0)
-		retval = count;
-
-	return retval;
+	return retval >= 0 ? count : retval;
 }
 
 static int mxt_selftest_release(struct inode *inode, struct file *file)
@@ -6535,24 +6616,19 @@ static const struct file_operations mxt_selftest_ops = {
 #define TP_INFO_MAX_LENGTH 50
 static ssize_t mxt_lockdown_info_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
-	char tmp[TP_INFO_MAX_LENGTH] = { 0 };
+	char tmp[TP_INFO_MAX_LENGTH];
+	int len;
 
-	if (*pos != 0 && g_mxt_data)
-		return 0;
+	if (!g_mxt_data)
+		return -ENODEV;
 
-	snprintf(tmp, TP_INFO_MAX_LENGTH,
+	len = scnprintf(tmp, sizeof(tmp),
 			"0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x\n",
 			g_mxt_data->lockdown_info[0], g_mxt_data->lockdown_info[1],
 			g_mxt_data->lockdown_info[2], g_mxt_data->lockdown_info[3],
 			g_mxt_data->lockdown_info[4], g_mxt_data->lockdown_info[5],
 			g_mxt_data->lockdown_info[6], g_mxt_data->lockdown_info[7]);
-	if (copy_to_user(buf, tmp, strlen(tmp))) {
-		return -EFAULT;
-	}
-
-	*pos += strlen(tmp);
-
-	return strlen(tmp);
+	return simple_read_from_buffer(buf, count, pos, tmp, len);
 }
 
 static const struct file_operations mxt_lockdown_info_ops = {
@@ -6624,8 +6700,6 @@ static int mxt_probe(struct i2c_client *client,
 		if (error) {
 			dev_err(&client->dev, "unable to set direction for gpio %d\n",
 				pdata->reset_gpio);
-			if (gpio_is_valid(pdata->reset_gpio))
-				gpio_free(pdata->reset_gpio);
 			goto err_pinctrl_sleep;
 		}
 	}
@@ -6679,6 +6753,10 @@ static int mxt_probe(struct i2c_client *client,
 		if (error != -ENOENT)
 			goto err_reset_gpio_req;
 		else {
+			if (!pdata->mxt_fw_name) {
+				error = -EINVAL;
+				goto err_reset_gpio_req;
+			}
 			error = mxt_update_firmware(&client->dev, NULL,
 					pdata->mxt_fw_name, strlen(pdata->mxt_fw_name),
 					&data->firmware_updated);
@@ -6743,8 +6821,8 @@ static int mxt_probe(struct i2c_client *client,
 	normal_mode_reg_save(data);
 	data->finish_init = 1;
 
-	proc_create("tp_selftest", 0664, NULL, &mxt_selftest_ops);
-	proc_create("tp_lockdown_info", 0664, NULL, &mxt_lockdown_info_ops);
+	data->tp_selftest_proc = proc_create("tp_selftest", 0664, NULL, &mxt_selftest_ops);
+	data->tp_lockdown_info_proc = proc_create("tp_lockdown_info", 0664, NULL, &mxt_lockdown_info_ops);
 
 	return 0;
 
@@ -6753,12 +6831,21 @@ err_remove_sysfs_group:
 err_free_irq:
 	free_irq(client->irq, data);
 err_free_input_device:
+#ifdef CONFIG_DRM
+	drm_unregister_client(&data->notif);
+#endif
 	input_unregister_device(data->input_dev);
 err_free_object:
-	kfree(data->msg_buf);
-	kfree(data->object_table);
 err_reset_gpio_req:
-	if (gpio_is_valid(pdata->reset_gpio))
+	cancel_delayed_work_sync(&data->calibration_delayed_work);
+	cancel_work_sync(&data->self_tuning_work);
+	cancel_work_sync(&data->hover_loading_work);
+	cancel_work_sync(&data->esd_work);
+	kfree(data->msg_buf);
+	data->msg_buf = NULL;
+	kfree(data->object_table);
+	data->object_table = NULL;
+	if (gpio_is_valid(pdata->reset_gpio) && !pdata->reset_low_prepower)
 		gpio_free(pdata->reset_gpio);
 err_irq_gpio_req:
 	if (gpio_is_valid(pdata->irq_gpio))
@@ -6781,10 +6868,23 @@ static int mxt_remove(struct i2c_client *client)
 {
 	struct mxt_data *data = i2c_get_clientdata(client);
 	const struct mxt_platform_data *pdata = data->pdata;
+
+	proc_remove(data->tp_lockdown_info_proc);
+	proc_remove(data->tp_selftest_proc);
+	debugfs_remove_recursive(debug_base);
+	debug_base = NULL;
 	power_supply_unreg_notifier(&data->power_supply_notif);
+#ifdef CONFIG_DRM
+	drm_unregister_client(&data->notif);
+#endif
 	sysfs_remove_bin_file(&client->dev.kobj, &data->mem_access_attr);
 	sysfs_remove_group(&client->dev.kobj, &mxt_attr_group);
 	free_irq(data->irq, data);
+	cancel_delayed_work_sync(&data->calibration_delayed_work);
+	cancel_work_sync(&data->self_tuning_work);
+	cancel_work_sync(&data->hover_loading_work);
+	cancel_work_sync(&data->esd_work);
+	cancel_work_sync(&data->noise_work);
 	input_unregister_device(data->input_dev);
 	kfree(data->msg_buf);
 	data->msg_buf = NULL;
@@ -6794,9 +6894,9 @@ static int mxt_remove(struct i2c_client *client)
 	mxt_configure_regulator(data, false);
 
 	if (gpio_is_valid(pdata->irq_gpio))
-		gpio_free (pdata->irq_gpio);
+		gpio_free(pdata->irq_gpio);
 
-	if (gpio_is_valid(pdata->reset_gpio))
+	if (gpio_is_valid(pdata->reset_gpio) && !pdata->reset_low_prepower)
 		gpio_free(pdata->reset_gpio);
 
 	if (data->ts_pinctrl) {
