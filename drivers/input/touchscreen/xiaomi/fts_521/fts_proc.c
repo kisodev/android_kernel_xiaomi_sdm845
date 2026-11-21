@@ -26,6 +26,7 @@
 #include <linux/fs.h>
 #include <linux/seq_file.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include "fts.h"
 #include "fts_lib/ftsCompensation.h"
@@ -176,6 +177,7 @@ static int limit;
 static int chunk;
 static int printed;
 static struct proc_dir_entry *fts_dir;
+static DEFINE_MUTEX(driver_test_mutex);
 static u8 *driver_test_buff;
 char buf_chunk[CHUNK_PROC];
 static Message mess;
@@ -189,22 +191,23 @@ static Message mess;
 */
 static void *fts_seq_start(struct seq_file *s, loff_t *pos)
 {
+	mutex_lock(&driver_test_mutex);
 	pr_info("%s: Entering start(), pos = %lld limit = %d printed = %d\n",
 		__func__, *pos, limit, printed);
 	if (driver_test_buff == NULL && *pos == 0) {
 		pr_info("%s: No data to print!\n", __func__);
-		driver_test_buff = (u8 *) kmalloc(13 * sizeof(u8), GFP_KERNEL);
+		driver_test_buff = kmalloc(16, GFP_KERNEL);
+		if (!driver_test_buff)
+			return NULL;
 
-		snprintf(driver_test_buff, PAGE_SIZE, "{ %08X }\n", ERROR_OP_NOT_ALLOW);
-
+		scnprintf(driver_test_buff, 16, "{ %08X }\n", ERROR_OP_NOT_ALLOW);
 		limit = strlen(driver_test_buff);
 	} else {
 		if (*pos != 0)
 			*pos += chunk - 1;
 
-		if (*pos >= limit) {
+		if (!driver_test_buff || *pos >= limit)
 			return NULL;
-		}
 	}
 
 	chunk = CHUNK_PROC;
@@ -260,23 +263,14 @@ static void *fts_seq_next(struct seq_file *s, void *v, loff_t *pos)
 */
 static void fts_seq_stop(struct seq_file *s, void *v)
 {
-
-	if (v) {
-		/* pr_err("%s: v is %X.\n", __func__, v); */
-	} else {
+	if (!v) {
 		limit = 0;
 		chunk = 0;
 		printed = 0;
-		if (driver_test_buff != NULL) {
-			kfree(driver_test_buff);
-			driver_test_buff = NULL;
-
-		} else {
-			/* pr_err("%s: driver_test_buff is already null.\n",
-			 *   __func__); */
-		}
+		kfree(driver_test_buff);
+		driver_test_buff = NULL;
 	}
-
+	mutex_unlock(&driver_test_mutex);
 }
 
 /**
@@ -323,7 +317,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 	int numberParam = 0;
 	struct fts_ts_info *info = dev_get_drvdata(getDev());
 	char *p = NULL;
-	char pbuf[count];
+	char *pbuf = NULL;
 	char path[101] = { 0 };
 	int res = -1, j, index = 0;
 	int size = 6;
@@ -331,8 +325,8 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 	u16 byteToRead = 0;
 	u32 fileSize = 0;
 	u8 *readData = NULL;
-	u8 cmd[count];
-	u32 funcToTest[((count + 1) / 3)];
+	u8 *cmd = NULL;
+	u32 *funcToTest = NULL;
 	u64 addr = 0;
 	MutualSenseFrame frameMS;
 	SelfSenseFrame frameSS;
@@ -350,27 +344,43 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 	Firmware fw;
 	LimitFile lim;
 
+	if (count == 0 || count > PAGE_SIZE * 4)
+		return -EINVAL;
+
+	pbuf = kzalloc(count + 1, GFP_KERNEL);
+	cmd = kzalloc(count, GFP_KERNEL);
+	funcToTest = kcalloc((count + 1) / 3 + 1, sizeof(u32), GFP_KERNEL);
+	if (!pbuf || !cmd || !funcToTest) {
+		kfree(pbuf);
+		kfree(cmd);
+		kfree(funcToTest);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&driver_test_mutex);
 	mess.dummy = 0;
 	mess.action = 0;
 	mess.msg_size = 0;
 
-	if (access_ok(VERIFY_READ, buf, count) < OK
-	    || copy_from_user(pbuf, buf, count) != 0) {
+	if (copy_from_user(pbuf, buf, count) != 0) {
 		res = ERROR_ALLOC;
 		goto END;
 	}
+	pbuf[count] = '\0';
 
 	p = pbuf;
-	if (count > MESSAGE_MIN_HEADER_SIZE - 1 && p[0] == MESSAGE_START_BYTE) {
+	if (count >= MESSAGE_MIN_HEADER_SIZE && p[0] == MESSAGE_START_BYTE) {
 		pr_info("Enter in Byte Mode!\n");
 		byte_call = 1;
 		mess.msg_size = (p[1] << 8) | p[2];
 		mess.counter = (p[3] << 8) | p[4];
 		mess.action = (p[5] << 8) | p[6];
-				pr_info("Message received: size = %d, counter_id = %d, action = %04X\n",
-			mess.msg_size, mess.counter, mess.action);
+		pr_info("Message received: size = %d, counter_id = %d, action = %04X\n",
+			 mess.msg_size, mess.counter, mess.action);
 		size = MESSAGE_MIN_HEADER_SIZE + 2;
-		if (count < mess.msg_size || p[count - 2] != MESSAGE_END_BYTE) {
+		if (mess.msg_size < MESSAGE_MIN_HEADER_SIZE || count < mess.msg_size ||
+		    (size_t)(7 + mess.msg_size - MESSAGE_MIN_HEADER_SIZE) > count ||
+		    p[count - 2] != MESSAGE_END_BYTE) {
 			pr_err("number of byte received or end byte wrong! msg_size = %d != %zu, last_byte = %02X != %02X ... ERROR %08X\n",
 				 mess.msg_size, count, p[count - 1],
 				 MESSAGE_END_BYTE, ERROR_OP_NOT_ALLOW);
@@ -461,9 +471,10 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 			break;
 
 		default:
-			for (; numberParam < (count + 1) / 3; numberParam++) {
-				sscanf(p, "%02X ", &funcToTest[numberParam]);
-				p += 3;
+			for (; numberParam < (count + 1) / 3 && (size_t)(p - pbuf) < count; numberParam++) {
+				if (sscanf(p, "%02X ", &funcToTest[numberParam]) != 1)
+					break;
+				p += min_t(size_t, 3, count - (size_t)(p - pbuf));
 				cmd[numberParam] = (u8) funcToTest[numberParam];
 				pr_info("functionToTest[%d] = %02X cmd[%d]= %02X\n",
 					 numberParam, funcToTest[numberParam],
@@ -1450,6 +1461,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 				if (fileSize > addr) {
 					pr_err("Limits dimension expected by Host is less than actual size: expected = %d, real = %d\n",
 						byteToRead, fileSize);
+					fileSize = addr;
 					res = ERROR_OP_NOT_ALLOW;
 				}
 
@@ -1494,6 +1506,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 				if (fileSize > addr) {
 					pr_err("FW dimension expected by Host is less than actual size: expected = %d, real = %d\n",
 						byteToRead, fileSize);
+					fileSize = addr;
 					res = ERROR_OP_NOT_ALLOW;
 				}
 
@@ -1524,7 +1537,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 					res);
 				goto END;
 			}
-			j = snprintf(&driver_test_buff[index], fileSize - index,
+			j = scnprintf(&driver_test_buff[index], fileSize - index,
 				     "DIAGNOSTIC TEST:\n1) I2C Test: ");
 			index += j;
 
@@ -1535,7 +1548,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 			if (res < OK) {
 				pr_err("Error during I2C test: ERROR %08X!\n",
 					res);
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index, "ERROR %08X \n",
 					     res);
 				index += j;
@@ -1545,7 +1558,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 
 			temp &= 0xFFFF;
 			pr_info("Chip ID = %04X!\n", temp);
-			j = snprintf(&driver_test_buff[index], fileSize - index,
+			j = scnprintf(&driver_test_buff[index], fileSize - index,
 				     "DATA = %04X, expected = %02X%02X \n",
 				     temp, DCHIP_ID_1, DCHIP_ID_0);
 			index += j;
@@ -1555,12 +1568,12 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 				goto END_DIAGNOSTIC;
 			}
 
-			j = snprintf(&driver_test_buff[index], fileSize - index,
+			j = scnprintf(&driver_test_buff[index], fileSize - index,
 				     "Present Driver Mode: %08X \n",
 				     info->mode);
 			index += j;
 
-			j = snprintf(&driver_test_buff[index], fileSize - index,
+			j = scnprintf(&driver_test_buff[index], fileSize - index,
 				     "2) FW running: Sensing On...");
 			index += j;
 			pr_info("Sensing On!\n");
@@ -1572,7 +1585,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 			if (res < OK) {
 				pr_err("No Echo received.. ERROR %08X !\n",
 					res);
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index,
 					     "No echo found... ERROR %08X!\n",
 					     res);
@@ -1580,19 +1593,19 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 				goto END_DIAGNOSTIC;
 			} else {
 				pr_info("Echo FOUND... OK!\n");
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index,
 					     "Echo FOUND... OK!\n");
 				index += j;
 			}
 
 			pr_info("Reading Frames...!\n");
-			j = snprintf(&driver_test_buff[index], fileSize - index,
+			j = scnprintf(&driver_test_buff[index], fileSize - index,
 				     "3) Read Frames: \n");
 			index += j;
 			for (temp = 0; temp < DIAGNOSTIC_NUM_FRAME; temp++) {
 				pr_info("Iteration n. %d...\n", temp + 1);
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index,
 					     "Iteration n. %d...\n", temp + 1);
 				index += j;
@@ -1644,7 +1657,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 							if (address %
 							    frameMS.header.
 							    sense_node == 0) {
-								j = snprintf
+								j = scnprintf
 								    (&driver_test_buff
 								     [index],
 								     fileSize -
@@ -1652,7 +1665,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 								     "\n");
 								index += j;
 							}
-							j = snprintf
+							j = scnprintf
 							    (&driver_test_buff
 							     [index],
 							     fileSize - index,
@@ -1718,7 +1731,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 						     address <
 						     frameSS.header.force_node;
 						     address++) {
-							j = snprintf
+							j = scnprintf
 							    (&driver_test_buff
 							     [index],
 							     fileSize - index,
@@ -1733,7 +1746,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 						     address <
 						     frameSS.header.sense_node;
 						     address++) {
-							j = snprintf
+							j = scnprintf
 							    (&driver_test_buff
 							     [index],
 							     fileSize - index,
@@ -1758,14 +1771,14 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 			}
 
 			pr_info("Reading error info...\n");
-			j = snprintf(&driver_test_buff[index], fileSize - index,
+			j = scnprintf(&driver_test_buff[index], fileSize - index,
 				     "4) FW INFO DUMP: ");
 			index += j;
 			temp = dumpErrorInfo(readData, ERROR_DUMP_ROW_SIZE * ERROR_DUMP_COL_SIZE);
 			if (temp < OK) {
 				pr_err("Error during dump: ERROR %08X!\n",
 					res);
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index, "ERROR %08X \n",
 					     temp);
 				index += j;
@@ -1784,7 +1797,7 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 							     ERROR_DUMP_COL_SIZE);
 						index += j;
 					}
-					j = snprintf(&driver_test_buff[index],
+					j = scnprintf(&driver_test_buff[index],
 						     fileSize - index, "%02X ",
 						     readData[temp]);
 					index += j;
@@ -1794,12 +1807,12 @@ static ssize_t fts_driver_test_write(struct file *file, const char __user *buf,
 
 END_DIAGNOSTIC:
 			if (res < OK) {
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index,
 					     "\nRESULT = FAIL \n");
 				index += j;
 			} else {
-				j = snprintf(&driver_test_buff[index],
+				j = scnprintf(&driver_test_buff[index],
 					     fileSize - index,
 					     "\nRESULT = FINISHED \n");
 				index += j;
@@ -1828,6 +1841,7 @@ END:
 	if (driver_test_buff != NULL) {
 		pr_info("Consecutive echo on the file node, free the buffer with the previous result\n");
 		kfree(driver_test_buff);
+		driver_test_buff = NULL;
 	}
 
 	if (byte_call == 0) {
@@ -2235,11 +2249,12 @@ END:
 				}
 				index += addr;
 			} else {
-				for (j = 0; j < fileSize; j++) {
-					index +=
-					    snprintf(&driver_test_buff[index],
-						     3, "%02X",
-						     (u8) readData[j]);
+				j = 0;
+				if (readData != NULL) {
+					for (; j < fileSize && j < addr; j++)
+						index += snprintf(&driver_test_buff[index],
+								  3, "%02X",
+								  (u8) readData[j]);
 				}
 				for (; j < addr; j++)
 					index += snprintf(&driver_test_buff[index], 3, "%02X", 0);
@@ -2258,6 +2273,10 @@ ERROR:
 	numberParam = 0;
 	if (readData != NULL)
 		kfree(readData);
+	mutex_unlock(&driver_test_mutex);
+	kfree(pbuf);
+	kfree(cmd);
+	kfree(funcToTest);
 
 	return count;
 }

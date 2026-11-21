@@ -596,7 +596,7 @@ int fts_writeU8UX(u8 cmd, AddrSize addrSize, u64 address, u8 *data,
 		  int dataSize)
 {
 
-	u8 finalCmd[1 + addrSize + WRITE_CHUNK];
+	u8 finalCmd[1 + sizeof(u64) + WRITE_CHUNK];
 	int remaining = dataSize;
 	int toWrite = 0, i = 0;
 

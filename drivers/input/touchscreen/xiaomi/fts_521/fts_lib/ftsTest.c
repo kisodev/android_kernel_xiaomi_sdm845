@@ -41,6 +41,7 @@
 #include <linux/delay.h>
 #include <linux/ctype.h>
 #include <linux/firmware.h>
+#include <linux/mutex.h>
 
 #ifdef LIMITS_H_FILE
 #include "../fts_limits.h"
@@ -48,6 +49,7 @@
 
 TestToDo tests;
 static LimitFile limit_file;
+static DEFINE_MUTEX(limit_file_mutex);
 
 /**
  * Initialize the testToDo variable with the default tests to perform during the Mass Production Test
@@ -2104,14 +2106,12 @@ int production_test_ms_cx(char *path_limits, int stop_on_fail, TestToDo *todo)
 		ret = production_test_ms_cx_lp(path_limits, stop_on_fail, todo);
 		if (ret < OK) {
 			count_fail += 1;
-			pr_err("production_test_data: production_test_ms_key_cx failed... ERROR = %08X\n",
+			pr_err("production_test_data: production_test_ms_cx_lp failed... ERROR = %08X\n",
 				ret);
-			pr_err("MS CX testes finished!.................FAILED  fails_count = %d\n\n",
-				count_fail);
-			return ret;
+			goto ERROR;
 		}
 	} else
-		pr_info("MS KEY CX TEST:.................SKIPPED\n");
+		pr_info("MS CX LP TEST:.................SKIPPED\n");
 
 	if ((todo->MutualKeyCx1 |
 	     todo->MutualKeyCx2 | todo->MutualKeyCxTotal) == 1) {
@@ -2122,9 +2122,7 @@ int production_test_ms_cx(char *path_limits, int stop_on_fail, TestToDo *todo)
 			count_fail += 1;
 			pr_err("production_test_data: production_test_ms_key_cx failed... ERROR = %08X\n",
 				ret);
-			pr_err("MS CX testes finished!.................FAILED  fails_count = %d\n\n",
-				count_fail);
-			return ret;
+			goto ERROR;
 		}
 	} else
 		pr_info("MS KEY CX TEST:.................SKIPPED\n");
@@ -2134,21 +2132,25 @@ ERROR:
 		pr_info("MS CX testes finished!.................OK\n");
 		kfree(msCompData.node_data);
 		msCompData.node_data = NULL;
+		kfree(totCompData.node_data);
+		totCompData.node_data = NULL;
 		return OK;
 	} else {
-		print_frame_i8("MS Init Data (Cx2) =",
-			       array1dTo2d_i8(msCompData.node_data,
-					      msCompData.node_data_size,
-					      msCompData.header.sense_node),
-			       msCompData.header.force_node,
-			       msCompData.header.sense_node);
-		print_frame_short(" TOT MS Init Data (Cx) =",
-				  array1dTo2d_short(totCompData.node_data,
-						    totCompData.node_data_size,
-						    totCompData.header.
-						    sense_node),
-				  totCompData.header.force_node,
-				  totCompData.header.sense_node);
+		if (msCompData.node_data != NULL)
+			print_frame_i8("MS Init Data (Cx2) =",
+				       array1dTo2d_i8(msCompData.node_data,
+						      msCompData.node_data_size,
+						      msCompData.header.sense_node),
+				       msCompData.header.force_node,
+				       msCompData.header.sense_node);
+		if (totCompData.node_data != NULL)
+			print_frame_short(" TOT MS Init Data (Cx) =",
+					  array1dTo2d_short(totCompData.node_data,
+							    totCompData.node_data_size,
+							    totCompData.header.
+							    sense_node),
+					  totCompData.header.force_node,
+					  totCompData.header.sense_node);
 		pr_err("MS CX testes finished!.................FAILED  fails_count = %d\n\n",
 			count_fail);
 
@@ -3095,10 +3097,10 @@ int production_test_ss_raw(char *path_limits, int stop_on_fail, TestToDo *todo)
 		} else
 			pr_info("SS RAW FORCE GAP TEST:.................SKIPPED\n\n");
 
-		kfree(ssRawFrame.force_data);
-		ssRawFrame.force_data = NULL;
 	} else
 		pr_info("SS RAW FORCE TEST:.................SKIPPED\n\n");
+	kfree(ssRawFrame.force_data);
+	ssRawFrame.force_data = NULL;
 
 	if (todo->SelfSenseRaw == 1 || todo->SelfSenseRawGap == 1) {
 		columns = ssRawFrame.header.sense_node;
@@ -3193,9 +3195,9 @@ int production_test_ss_raw(char *path_limits, int stop_on_fail, TestToDo *todo)
 		} else
 			pr_info("SS RAW SENSE GAP TEST:.................SKIPPED\n");
 
-		kfree(ssRawFrame.sense_data);
-		ssRawFrame.sense_data = NULL;
 	}
+	kfree(ssRawFrame.sense_data);
+	ssRawFrame.sense_data = NULL;
 
 	ret = production_test_ss_raw_lp(path_limits, stop_on_fail, todo);
 
@@ -3356,10 +3358,10 @@ int production_test_ss_raw_lp(char *path_limits, int stop_on_fail,
 		} else
 			pr_info("SS RAW LP FORCE GAP TEST:.................SKIPPED\n\n");
 
-		kfree(ssRawFrame.force_data);
-		ssRawFrame.force_data = NULL;
 	} else
 		pr_info("SS RAW LP FORCE TEST:.................SKIPPED\n\n");
+	kfree(ssRawFrame.force_data);
+	ssRawFrame.force_data = NULL;
 	
 	pr_info("SS RAW LP SENSE TEST:\n");
 	if (todo->SelfSenseRawLP == 1 || todo->SelfSenseRawGapLP == 1) {
@@ -3455,9 +3457,9 @@ int production_test_ss_raw_lp(char *path_limits, int stop_on_fail,
 		} else
 			pr_info("SS RAW LP SENSE GAP TEST:.................SKIPPED\n");
 
-		kfree(ssRawFrame.sense_data);
-		ssRawFrame.sense_data = NULL;
 	}
+	kfree(ssRawFrame.sense_data);
+	ssRawFrame.sense_data = NULL;
 
 	if (count_fail == 0) {
 		pr_info("SS RAW LP testes finished!.................OK\n\n");
@@ -4772,7 +4774,12 @@ int freeLimitsFile(LimitFile *file)
 
 int freeCurrentLimitsFile(void)
 {
-	return freeLimitsFile(&limit_file);
+	int ret;
+
+	mutex_lock(&limit_file_mutex);
+	ret = freeLimitsFile(&limit_file);
+	mutex_unlock(&limit_file_mutex);
+	return ret;
 }
 
 /**
@@ -4800,13 +4807,15 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 	int n, size, pointer = 0, ret = OK;
 	char *data_file = NULL;
 
-	if (file == NULL || strcmp(path, file->name) != 0 || file->size == 0) {
+	mutex_lock(&limit_file_mutex);
+	if (file == NULL || (path != NULL && strcmp(path, file->name) != 0) || file->size == 0) {
 		pr_info("No limit File data passed... try to get them from the system!\n");
-		ret = getLimitsFile(LIMITS_FILE, &limit_file);
+		ret = getLimitsFile(path ? path : LIMITS_FILE, &limit_file);
 
 		if (ret < OK) {
 			pr_err("parseProductionTestLimits: ERROR %08X\n",
 				ERROR_FILE_NOT_FOUND);
+			mutex_unlock(&limit_file_mutex);
 			return ERROR_FILE_NOT_FOUND;
 		}
 
@@ -4821,7 +4830,7 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 	pr_info("The size of the limits file is %d bytes...\n", size);
 
 	while (find == 0) {
-		if (readLine(&data_file[pointer], line, size - pointer, &n) < 0) {
+		if (readLine(&data_file[pointer], line, sizeof(line), size - pointer, &n) < 0) {
 			find = -1;
 			break;
 		}
@@ -4846,8 +4855,7 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 				find = 1;
 				token = strsep(&line2, ",");
 
-				if (token != NULL) {
-					sscanf(token, "%d", row);
+				if (token != NULL && sscanf(token, "%d", row) == 1) {
 					pr_info("Row = %d\n", *row);
 				} else {
 					pr_err("parseProductionTestLimits 1: ERROR %08X\n",
@@ -4858,8 +4866,7 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 
 				token = strsep(&line2, ",");
 
-				if (token != NULL) {
-					sscanf(token, "%d", column);
+				if (token != NULL && sscanf(token, "%d", column) == 1) {
 					pr_info("Column = %d\n", *column);
 				} else {
 					pr_err("parseProductionTestLimits 2: ERROR %08X\n",
@@ -4870,7 +4877,12 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 
 				kfree(buf);
 				buf = NULL;
-				*data = (int *)kmalloc(((*row) * (*column)) * sizeof(int), GFP_KERNEL);
+				if (*row <= 0 || *column <= 0 ||
+				    *row > INT_MAX / *column) {
+					ret = ERROR_FILE_PARSE;
+					goto END;
+				}
+				*data = kmalloc_array((*row) * (*column), sizeof(int), GFP_KERNEL);
 				j = 0;
 
 				if (*data == NULL) {
@@ -4882,7 +4894,7 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 
 				for (i = 0; i < *row; i++) {
 					if (readLine
-					    (&data_file[pointer], line,
+					    (&data_file[pointer], line, sizeof(line),
 					     size - pointer, &n) < 0) {
 						pr_err("parseProductionTestLimits : ERROR %08X\n",
 							ERROR_FILE_READ);
@@ -4906,8 +4918,9 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 					for (z = 0;
 					     (z < *column) && (token != NULL);
 					     z++) {
-						sscanf(token, "%d",
-						       ((*data) + j));
+						if (sscanf(token, "%d",
+							   ((*data) + j)) != 1)
+							break;
 						j++;
 						token = strsep(&line2, ",");
 					}
@@ -4922,6 +4935,8 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 					goto END;
 				}
 
+				kfree(*data);
+				*data = NULL;
 				pr_err("parseProductionTestLimits 3: ERROR %08X\n",
 					ERROR_FILE_PARSE);
 				ret = ERROR_FILE_PARSE;
@@ -4937,10 +4952,8 @@ int parseProductionTestLimits(char *path, LimitFile *file, char *label,
 		ERROR_LABEL_NOT_FOUND);
 	ret = ERROR_LABEL_NOT_FOUND;
 END:
-
-	if (buf != NULL)
-		kfree(buf);
-
+	kfree(buf);
+	mutex_unlock(&limit_file_mutex);
 	return ret;
 }
 
@@ -4948,23 +4961,25 @@ END:
  * Read one line of a text file passed as array of byte and terminate it with a termination character '\0'
  * @param data text file as array of bytes
  * @param line pointer to an array of char that will contain the line read
+ * @param max_len maximum capacity of line including NUL terminator
  * @param size size of data
  * @param n pointer to a int variable which will contain the number of characters of the line
  * @return OK if success or an error code which specify the type of error encountered
  */
-int readLine(char *data, char *line, int size, int *n)
+int readLine(char *data, char *line, int max_len, int size, int *n)
 {
 	int i = 0;
 
-	if (size < 1)
+	if (size < 1 || max_len < 1)
 		return -EINVAL;
 
-	while (data[i] != '\n' && i < size) {
-		line[i] = data[i];
+	while (i < size && data[i] != '\n') {
+		if (i < max_len - 1)
+			line[i] = data[i];
 		i++;
 	}
 
-	*n = i + 1;
-	line[i] = '\0';
+	*n = (i < size) ? (i + 1) : i;
+	line[min(i, max_len - 1)] = '\0';
 	return OK;
 }

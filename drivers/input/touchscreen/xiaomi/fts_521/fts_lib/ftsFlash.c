@@ -449,12 +449,16 @@ int parseBinFile(u8 *fw_data, int fw_size, Firmware *fwData, int keep_cx)
 
 		index += FW_BYTES_ALLIGN;
 
-		dimension =
-		    fwData->sec0_size + fwData->sec1_size + fwData->sec2_size +
-		    fwData->sec3_size;
+		if (fwData->sec0_size > fw_size || fwData->sec1_size > fw_size ||
+		    fwData->sec2_size > fw_size || fwData->sec3_size > fw_size) {
+			res = ERROR_FILE_PARSE;
+			goto END;
+		}
+		dimension = fwData->sec0_size + fwData->sec1_size +
+			    fwData->sec2_size + fwData->sec3_size;
 		temp = fw_size;
 
-		if (dimension + FW_HEADER_SIZE + FW_BYTES_ALLIGN != temp) {
+		if (dimension < 0 || dimension + FW_HEADER_SIZE + FW_BYTES_ALLIGN != temp) {
 			pr_err("parseBinFile: Read only %d instead of %d... ERROR %08X\n",
 				fw_size, dimension + FW_HEADER_SIZE +
 				FW_BYTES_ALLIGN, ERROR_FILE_PARSE);
@@ -472,7 +476,7 @@ int parseBinFile(u8 *fw_data, int fw_size, Firmware *fwData, int keep_cx)
 
 		index += FW_BYTES_ALLIGN;
 		memcpy(fwData->data, &fw_data[index], dimension);
-		if (fwData->sec2_size != 0) {
+		if (fwData->sec2_size >= FW_CX_VERSION + 2) {
 			u8ToU16(&fwData->data
 				[fwData->sec0_size + fwData->sec1_size +
 				 FW_CX_VERSION], &fwData->cx_ver);
@@ -589,7 +593,8 @@ int flash_full_erase(void)
 int flash_erase_page_by_page(ErasePage keep_cx)
 {
 
-	u8 status, i = 0;
+	int status;
+	u8 i = 0;
 	u8 cmd1[6] = { FTS_CMD_HW_REG_W, 0x20, 0x00, 0x00, FLASH_ERASE_CODE0 + 1, 0x00 };
 	u8 cmd[6] = { FTS_CMD_HW_REG_W, 0x20, 0x00, 0x00, FLASH_ERASE_CODE0, 0xA0 };
 	u8 cmd2[9] = { FTS_CMD_HW_REG_W, 0x20, 0x00, 0x01, 0x28, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -818,9 +823,10 @@ int flash_burn(Firmware fw, int force_burn, int keep_cx)
 			for (res = EXTERNAL_RELEASE_INFO_SIZE - 1; res >= 0;
 			     res--) {
 				if (fw.externalRelease[res] >
-				    systemInfo.u8_releaseInfo[res])
+				    systemInfo.u8_releaseInfo[res]) {
 					force_burn = 0;
-				goto start;
+					goto start;
+				}
 			}
 			pr_info("flash_burn: CRC in CX but fw does not contain CX data! NO UPDATE ERROR %08X\n",
 			ERROR_FW_NO_UPDATE);

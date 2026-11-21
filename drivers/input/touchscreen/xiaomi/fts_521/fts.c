@@ -232,9 +232,11 @@ static ssize_t fts_fwupdate_store(struct device *dev,
 	/* by default(if not specified by the user) set the force = 0 and keep_cx to 1 */
 	mode[0] = 0;
 	mode[1] = 1;
+	path[0] = '\0';
 
 	/* reading out firmware upgrade parameters */
-	sscanf(buf, "%100s %d %d", path, &mode[0], &mode[1]);
+	if (sscanf(buf, "%100s %d %d", path, &mode[0], &mode[1]) < 1)
+		return -EINVAL;
 	pr_info("%s: fts_fwupdate_store: path = %s \n", __func__, path);
 
 	ret = flashProcedure(path, mode[0], mode[1]);
@@ -488,7 +490,10 @@ static ssize_t fts_feature_enable_show(struct device *dev,
 static ssize_t double_tap_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", fts_info->gesture_enabled);
+	if (!fts_info)
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", fts_info->gesture_enabled);
 }
 
 static ssize_t double_tap_store(struct kobject *kobj,
@@ -498,14 +503,20 @@ static ssize_t double_tap_store(struct kobject *kobj,
 	int rc, val;
 	struct fts_mode_switch *ms;
 
+	if (!fts_info)
+		return -ENODEV;
+
 	rc = kstrtoint(buf, 10, &val);
 	if (rc)
 		return -EINVAL;
 
-	ms = (struct fts_mode_switch *)
-	    kmalloc(sizeof(struct fts_mode_switch), GFP_ATOMIC);
+	ms = kmalloc(sizeof(*ms), GFP_KERNEL);
+	if (!ms)
+		return -ENOMEM;
 
-	fts_info->gesture_enabled = !!val;
+	ms->info = fts_info;
+	ms->mode = val ? INPUT_EVENT_WAKUP_MODE_ON : INPUT_EVENT_WAKUP_MODE_OFF;
+	INIT_WORK(&ms->switch_mode_work, fts_switch_mode_work);
 	schedule_work(&ms->switch_mode_work);
 	return count;
 }
@@ -1664,13 +1675,17 @@ static ssize_t fts_lockdown_store(struct device *dev,
 				  const char *buf, size_t count)
 {
 	int n, i, ret;
-	char *p = (char *)buf;
+	const char *p = buf;
 	u8 *typecomand = NULL;
 
 	memset(typeOfCommand, 0, CMD_STR_LEN * sizeof(u8));
-	for (n = 0; n < (count + 1) / 3; n++) {
-		sscanf(p, "%02X ", &typeOfCommand[n]);
-		p += 3;
+	for (n = 0; n < (count + 1) / 3 && n < CMD_STR_LEN && (size_t)(p - buf) < count; n++) {
+		unsigned int tmp_val = 0;
+
+		if (sscanf(p, "%02X ", &tmp_val) != 1)
+			break;
+		typeOfCommand[n] = (u8)tmp_val;
+		p += min_t(size_t, 3, count - (size_t)(p - buf));
 		pr_info("%s: command_sequence[%d] = %02X\n", __func__, n,
 			 typeOfCommand[n]);
 	}
@@ -1678,11 +1693,10 @@ static ssize_t fts_lockdown_store(struct device *dev,
 	if (numberParameters < 3)
 		goto END;
 
-	typecomand =
-	    (u8 *) kmalloc((numberParameters - 2) * sizeof(u8), GFP_KERNEL);
+	typecomand = kmalloc((numberParameters - 2) * sizeof(u8), GFP_KERNEL);
 	if (typecomand != NULL) {
 		for (i = 0; i < numberParameters - 2; i++) {
-			typecomand[i] = (u8) typeOfCommand[i + 2];
+			typecomand[i] = typeOfCommand[i + 2];
 			pr_info("%s: typecomand[%d] = %X \n", __func__, i,
 				 typecomand[i]);
 		}
@@ -1690,12 +1704,10 @@ static ssize_t fts_lockdown_store(struct device *dev,
 		goto END;
 	}
 
-	ret =
-	    writeLockDownInfo(typecomand, numberParameters - 2,
-			      typeOfCommand[0]);
-	if (ret < 0) {
+	ret = writeLockDownInfo(typecomand, numberParameters - 2,
+				typeOfCommand[0]);
+	if (ret < 0)
 		pr_err("%s: fts_lockdown_store failed\n", __func__);
-	}
 	kfree(typecomand);
 END:
 	pr_err("%s: Number of Parameters = %d\n", __func__, numberParameters);
@@ -1711,24 +1723,27 @@ static ssize_t fts_lockdown_show(struct device *dev,
 	u8 type;
 	u8 *temp_buffer = NULL;
 
-	temp_buffer = (u8 *) kmalloc(LOCKDOWN_LENGTH * sizeof(u8), GFP_KERNEL);
+	temp_buffer = kmalloc(LOCKDOWN_LENGTH * sizeof(u8), GFP_KERNEL);
 	if (temp_buffer == NULL || numberParameters < 2) {
-		count +=
-		    snprintf(&buf[count], PAGE_SIZE, "prepare read lockdown failded\n");
+		count += scnprintf(&buf[count], PAGE_SIZE - count,
+				   "prepare read lockdown failed\n");
+		kfree(temp_buffer);
 		return count;
 	}
 	type = typeOfCommand[0];
-	size = (int)(typeOfCommand[1]);
-	count += snprintf(&buf[count], PAGE_SIZE, "read lock down code:\n");
+	size = min_t(int, typeOfCommand[1], LOCKDOWN_LENGTH);
+	count += scnprintf(&buf[count], PAGE_SIZE - count,
+			   "read lock down code:\n");
 	ret = readLockDownInfo(temp_buffer, type, size);
 	if (ret < OK) {
-		count += snprintf(&buf[count], PAGE_SIZE, "read lockdown failded\n");
+		count += scnprintf(&buf[count], PAGE_SIZE - count,
+				   "read lockdown failed\n");
 		goto END;
 	}
-	for (i = 0; i < size; i++) {
-		count += snprintf(&buf[count], PAGE_SIZE, "%02X ", temp_buffer[i]);
-	}
-	count += snprintf(&buf[count], PAGE_SIZE, "\n");
+	for (i = 0; i < size; i++)
+		count += scnprintf(&buf[count], PAGE_SIZE - count,
+				   "%02X ", temp_buffer[i]);
+	count += scnprintf(&buf[count], PAGE_SIZE - count, "\n");
 
 END:
 	numberParameters = 0;
@@ -1739,9 +1754,8 @@ END:
 static ssize_t fts_selftest_info_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
-	int res = 0, i = 0, count = 0, force_node = 0, sense_node = 0, pos =
-	    0, last_pos = 0;
-	MutualSenseFrame frameMS;
+	int res = 0, i = 0, count = 0, force_node = 0, sense_node = 0, pos = 0;
+	MutualSenseFrame frameMS = { .node_data = NULL };
 	char buff[80];
 	struct i2c_client *client = to_i2c_client(dev);
 	struct fts_ts_info *info = i2c_get_clientdata(client);
@@ -1764,19 +1778,16 @@ static ssize_t fts_selftest_info_show(struct device *dev,
 
 	sense_node = frameMS.header.sense_node;
 	force_node = frameMS.header.force_node;
+	kfree(frameMS.node_data);
 
+	memset(buff, 0, sizeof(buff));
 	for (i = 0; i < RELEASE_INFO_SIZE; i++) {
-		if (i == 0) {
-			pos +=
-			    snprintf(buff + last_pos, PAGE_SIZE, "0x%02x",
-				     systemInfo.u8_releaseInfo[i]);
-			last_pos = pos;
-		} else {
-			pos +=
-			    snprintf(buff + last_pos, PAGE_SIZE, "%02x",
-				     systemInfo.u8_releaseInfo[i]);
-			last_pos = pos;
-		}
+		if (i == 0)
+			pos += scnprintf(buff + pos, sizeof(buff) - pos, "0x%02x",
+					 systemInfo.u8_releaseInfo[i]);
+		else
+			pos += scnprintf(buff + pos, sizeof(buff) - pos, "%02x",
+					 systemInfo.u8_releaseInfo[i]);
 	}
 	count =
 	    snprintf(buf, PAGE_SIZE,
@@ -1792,12 +1803,11 @@ END:
 static ssize_t fts_ms_raw_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
-	int res = 0, count = 0, j = 0, sense_node = 0, force_node = 0, pos =
-	    0, last_pos = 0;
+	int res = 0, count = 0, j = 0, sense_node = 0, force_node = 0, pos = 0;
 	char *all_strbuff = NULL;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct fts_ts_info *info = i2c_get_clientdata(client);
-	MutualSenseFrame frameMS;
+	MutualSenseFrame frameMS = { { 0 } };
 
 	res = fts_disableInterrupt();
 	if (res < OK)
@@ -1820,42 +1830,29 @@ static ssize_t fts_ms_raw_show(struct device *dev,
 	fts_mode_handler(info, 1);
 	sense_node = frameMS.header.sense_node;
 	force_node = frameMS.header.force_node;
-	pos +=
-	    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-		     "MsTouchRaw,%2d,%2d\n ,", force_node, sense_node);
-	last_pos = pos;
-	if (res >= OK) {
+	pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+			 "MsTouchRaw,%2d,%2d\n ,", force_node, sense_node);
+	if (res >= OK && sense_node > 0) {
 		for (j = 0; j < sense_node; j++)
-			if ((j + 1) % sense_node) {
-				pos +=
-				    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-					     "C%02d,", j);
-				last_pos = pos;
-			} else {
-				pos +=
-				    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-					     "C%02d\nR00,", j);
-				last_pos = pos;
-			}
+			if ((j + 1) % sense_node)
+				pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+						 "C%02d,", j);
+			else
+				pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+						 "C%02d\nR00,", j);
 		for (j = 0; j < sense_node * force_node; j++) {
 			if ((j + 1) % sense_node) {
-				pos +=
-				    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-					     "%4d,", frameMS.node_data[j]);
-				last_pos = pos;
+				pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+						 "%4d,", frameMS.node_data[j]);
 			} else {
 				if ((j + 1) / sense_node != force_node)
-					pos +=
-					    snprintf(all_strbuff + last_pos,
-						     PAGE_SIZE, "%4d\nR%02d,",
-						     frameMS.node_data[j],
-						     (j + 1) / sense_node);
+					pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+							 "%4d\nR%02d,",
+							 frameMS.node_data[j],
+							 (j + 1) / sense_node);
 				else
-					pos +=
-					    snprintf(all_strbuff + last_pos,
-						     PAGE_SIZE, "%4d\n",
-						     frameMS.node_data[j]);
-				last_pos = pos;
+					pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+							 "%4d\n", frameMS.node_data[j]);
 			}
 		}
 		if (frameMS.node_data) {
@@ -1874,71 +1871,54 @@ END:
 static ssize_t fts_ms_cx_total_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
-	int res = 0, pos = 0, last_pos = 0, count = 0, j = 0, sense_node =
-	    0, force_node = 0;
+	int res = 0, pos = 0, count = 0, j = 0, sense_node = 0, force_node = 0;
 	char *all_strbuff = NULL;
-	TotMutualSenseData totCompData;
+	TotMutualSenseData totCompData = { { 0 } };
 
 	res = fts_disableInterrupt();
 	if (res < OK)
 		goto END;
-	all_strbuff = vmalloc(PAGE_SIZE);
+	all_strbuff = vzalloc(PAGE_SIZE);
 	if (!all_strbuff) {
 		pr_err("%s: Unable to allocate all_strbuff! ERROR %08X !\n",
 			__func__, ERROR_ALLOC);
 		goto END;
-	} else
-		memset(all_strbuff, 0, PAGE_SIZE);
+	}
 
 	res =
 	    readTotMutualSenseCompensationData(LOAD_PANEL_CX_TOT_MS_TOUCH,
 					       &totCompData);
-	if (res >= OK) {
+	if (res >= OK && totCompData.header.sense_node > 0) {
 		sense_node = totCompData.header.sense_node;
 		force_node = totCompData.header.force_node;
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-			     "MsTouchTotalCx,%2d,%2d\n ,", force_node,
-			     sense_node);
-		last_pos = pos;
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "MsTouchTotalCx,%2d,%2d\n ,", force_node,
+				 sense_node);
 		for (j = 0; j < sense_node; j++)
-			if ((j + 1) % sense_node) {
-				pos +=
-				    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-					     "C%02d,", j);
-				last_pos = pos;
-			} else {
-				pos +=
-				    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-					     "C%02d\nR00,", j);
-				last_pos = pos;
-			}
+			if ((j + 1) % sense_node)
+				pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+						 "C%02d,", j);
+			else
+				pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+						 "C%02d\nR00,", j);
 		for (j = 0; j < sense_node * force_node; j++) {
 			if ((j + 1) % sense_node) {
-				pos +=
-				    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-					     "%4d,", totCompData.node_data[j]);
-				last_pos = pos;
+				pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+						 "%4d,", totCompData.node_data[j]);
 			} else {
 				if ((j + 1) / sense_node != force_node)
-					pos +=
-					    snprintf(all_strbuff + last_pos,
-						     PAGE_SIZE, "%4d\nR%02d,",
-						     totCompData.node_data[j],
-						     (j + 1) / sense_node);
+					pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+							 "%4d\nR%02d,",
+							 totCompData.node_data[j],
+							 (j + 1) / sense_node);
 				else
-					pos +=
-					    snprintf(all_strbuff + last_pos,
-						     PAGE_SIZE, "%4d\n",
-						     totCompData.node_data[j]);
-				last_pos = pos;
+					pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+							 "%4d\n", totCompData.node_data[j]);
 			}
 		}
-		if (totCompData.node_data) {
-			kfree(totCompData.node_data);
-			totCompData.node_data = NULL;
-		}
 	}
+	kfree(totCompData.node_data);
+	totCompData.node_data = NULL;
 
 	count = snprintf(buf, PAGE_SIZE, "%s\n", all_strbuff);
 	vfree(all_strbuff);
@@ -1951,102 +1931,64 @@ END:
 static ssize_t fts_ss_ix_total_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
-	int ret = 0, pos = 0, last_pos = 0, count = 0, j = 0, sense_node =
-	    0, force_node = 0;
+	int ret = 0, pos = 0, count = 0, j = 0, sense_node = 0, force_node = 0;
 	char *all_strbuff = NULL;
-	TotSelfSenseData totCompData;
+	TotSelfSenseData totCompData = { { 0 } };
 
 	ret = fts_disableInterrupt();
 	if (ret < OK)
 		goto END;
-	all_strbuff = vmalloc(PAGE_SIZE);
+	all_strbuff = vzalloc(PAGE_SIZE);
 	if (!all_strbuff) {
 		pr_err("%s: Unable to allocate all_strbuff! ERROR %08X !\n",
 			__func__, ERROR_ALLOC);
 		goto END;
-	} else {
-		memset(all_strbuff, 0, PAGE_SIZE);
 	}
-	ret =
-	    readTotSelfSenseCompensationData(LOAD_PANEL_CX_TOT_SS_TOUCH,
-					     &totCompData);
+	ret = readTotSelfSenseCompensationData(LOAD_PANEL_CX_TOT_SS_TOUCH,
+					       &totCompData);
 	if (ret < 0) {
 		pr_err("%s: production_test_data: readTotSelfSenseCompensationData failed... ERROR %08X \n",
 			 __func__, ERROR_PROD_TEST_DATA);
-		goto END;
+		goto free_buf;
 	}
 
 	sense_node = 1;
 	force_node = totCompData.header.force_node;
 
-	pos +=
-	    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-		     "SsTouchForceTotalIx,%2d,1\n ,C00\n", force_node);
-	last_pos = pos;
-	for (j = 0; j < force_node; j++) {
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE, "R%02d,%4d\n",
-			     j, totCompData.ix_fm[j]);
-		last_pos = pos;
-	}
+	pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+			 "SsTouchForceTotalIx,%2d,1\n ,C00\n", force_node);
+	for (j = 0; j < force_node; j++)
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "R%02d,%4d\n", j, totCompData.ix_fm[j]);
 
-	pos +=
-	    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-		     "SsTouchForceTotalCx,%2d,1\n ,C00\n", force_node);
-	last_pos = pos;
-	for (j = 0; j < force_node; j++) {
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE, "R%02d,%4d\n",
-			     j, totCompData.cx_fm[j]);
-		last_pos = pos;
-	}
+	pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+			 "SsTouchForceTotalCx,%2d,1\n ,C00\n", force_node);
+	for (j = 0; j < force_node; j++)
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "R%02d,%4d\n", j, totCompData.cx_fm[j]);
 
 	sense_node = totCompData.header.sense_node;
 	force_node = 1;
 
-	pos +=
-	    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-		     "SsTouchsenseTotalIx,%2d,1\n ,C00\n", sense_node);
-	last_pos = pos;
-	for (j = 0; j < sense_node; j++) {
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE, "R%02d,%4d\n",
-			     j, totCompData.ix_sn[j]);
-		last_pos = pos;
-	}
+	pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+			 "SsTouchsenseTotalIx,%2d,1\n ,C00\n", sense_node);
+	for (j = 0; j < sense_node; j++)
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "R%02d,%4d\n", j, totCompData.ix_sn[j]);
 
-	pos +=
-	    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-		     "SsTouchsenseTotalCx,%2d,1\n ,C00\n", sense_node);
-	last_pos = pos;
-	for (j = 0; j < sense_node; j++) {
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE, "R%02d,%4d\n",
-			     j, totCompData.cx_sn[j]);
-		last_pos = pos;
-	}
+	pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+			 "SsTouchsenseTotalCx,%2d,1\n ,C00\n", sense_node);
+	for (j = 0; j < sense_node; j++)
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "R%02d,%4d\n", j, totCompData.cx_sn[j]);
 
-	if (totCompData.ix_fm != NULL) {
-		kfree(totCompData.ix_fm);
-		totCompData.ix_fm = NULL;
-	}
-
-	if (totCompData.cx_fm != NULL) {
-		kfree(totCompData.cx_fm);
-		totCompData.cx_fm = NULL;
-	}
-
-	if (totCompData.ix_sn != NULL) {
-		kfree(totCompData.ix_sn);
-		totCompData.ix_sn = NULL;
-	}
-
-	if (totCompData.cx_sn != NULL) {
-		kfree(totCompData.cx_sn);
-		totCompData.cx_sn = NULL;
-	}
+	kfree(totCompData.ix_fm);
+	kfree(totCompData.cx_fm);
+	kfree(totCompData.ix_sn);
+	kfree(totCompData.cx_sn);
 
 	count = snprintf(buf, PAGE_SIZE, "%s\n", all_strbuff);
+free_buf:
 	vfree(all_strbuff);
 END:
 	fts_enableInterrupt();
@@ -2056,23 +1998,21 @@ END:
 static ssize_t fts_ss_raw_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
-	int res = 0, count = 0, j = 0, sense_node = 0, force_node = 0, pos =
-	    0, last_pos = 0;
+	int res = 0, count = 0, j = 0, sense_node = 0, force_node = 0, pos = 0;
 	char *all_strbuff = NULL;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct fts_ts_info *info = i2c_get_clientdata(client);
-	SelfSenseFrame frameSS;
+	SelfSenseFrame frameSS = { { 0 } };
 
 	res = fts_disableInterrupt();
 	if (res < OK)
 		goto END;
-	all_strbuff = vmalloc(PAGE_SIZE * 4);
+	all_strbuff = vzalloc(PAGE_SIZE);
 	if (!all_strbuff) {
 		pr_err("%s: Unable to allocate all_strbuff! ERROR %08X !\n",
 			__func__, ERROR_ALLOC);
 		goto END;
-	} else
-		memset(all_strbuff, 0, PAGE_SIZE);
+	}
 	setScanMode(SCAN_MODE_ACTIVE, 0x01);
 	mdelay(WAIT_FOR_FRESH_FRAMES);
 	setScanMode(SCAN_MODE_ACTIVE, 0x00);
@@ -2083,58 +2023,35 @@ static ssize_t fts_ss_raw_show(struct device *dev,
 	fts_mode_handler(info, 1);
 	sense_node = frameSS.header.sense_node;
 	force_node = frameSS.header.force_node;
-	pos +=
-	    snprintf(all_strbuff + last_pos, PAGE_SIZE, "SsTouchRaw,%2d,%2d\n",
-		     force_node, sense_node);
-	last_pos = pos;
+	pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+			 "SsTouchRaw,%2d,%2d\n", force_node, sense_node);
 	if (res >= OK) {
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-			     "SS force frame\n ,");
-		last_pos = pos;
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "SS force frame\n ,");
 
-		for (j = 0; j < frameSS.header.force_node - 1; j++) {
-			pos +=
-			    snprintf(all_strbuff + last_pos, PAGE_SIZE, "%04d,",
-				     frameSS.force_data[j]);
-			last_pos = pos;
-		}
+		for (j = 0; j < frameSS.header.force_node - 1; j++)
+			pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+					 "%04d,", frameSS.force_data[j]);
 
-		if (j == frameSS.header.force_node - 1) {
-			pos +=
-			    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-				     "%04d\n", frameSS.force_data[j]);
-			last_pos = pos;
-		}
+		if (j == frameSS.header.force_node - 1)
+			pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+					 "%04d\n", frameSS.force_data[j]);
 
-		pos +=
-		    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-			     "SS sense frame\n ,");
-		last_pos = pos;
+		pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+				 "SS sense frame\n ,");
 
-		for (j = 0; j < frameSS.header.sense_node - 1; j++) {
-			pos +=
-			    snprintf(all_strbuff + last_pos, PAGE_SIZE, "%04d,",
-				     frameSS.sense_data[j]);
-			last_pos = pos;
-		}
+		for (j = 0; j < frameSS.header.sense_node - 1; j++)
+			pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+					 "%04d,", frameSS.sense_data[j]);
 
-		if (j == frameSS.header.sense_node - 1) {
-			pos +=
-			    snprintf(all_strbuff + last_pos, PAGE_SIZE,
-				     "%04d\n", frameSS.sense_data[j]);
-			last_pos = pos;
-		}
+		if (j == frameSS.header.sense_node - 1)
+			pos += scnprintf(all_strbuff + pos, PAGE_SIZE - pos,
+					 "%04d\n", frameSS.sense_data[j]);
 
-		if (frameSS.force_data) {
-			kfree(frameSS.force_data);
-			frameSS.force_data = NULL;
-		}
-		if (frameSS.sense_data) {
-			kfree(frameSS.sense_data);
-			frameSS.sense_data = NULL;
-		}
-
+		kfree(frameSS.force_data);
+		frameSS.force_data = NULL;
+		kfree(frameSS.sense_data);
+		frameSS.sense_data = NULL;
 	}
 
 	count = snprintf(buf, PAGE_SIZE, "%s\n", all_strbuff);
@@ -2166,18 +2083,14 @@ static ssize_t fts_strength_frame_show(struct device *dev,
 			__func__, res);
 		goto END;
 	}
-	size = (res * 5) + 11;
+	size = min_t(int, (res * 5) + 11, PAGE_SIZE);
 
-	/*
-	   flushFIFO();
-	 */
 	fts_mode_handler(info, 1);
-	all_strbuff = (char *)kmalloc(PAGE_SIZE * sizeof(char), GFP_KERNEL);
+	all_strbuff = kzalloc(PAGE_SIZE, GFP_KERNEL);
 
 	if (all_strbuff != NULL) {
-		memset(all_strbuff, 0, size);
 		snprintf(all_strbuff, size, "ms_differ\n");
-		if (res >= OK) {
+		if (res >= OK && frame.header.sense_node > 0) {
 			for (j = 0; j < frame.node_data_size; j++) {
 				if ((j + 1) % frame.header.sense_node)
 					snprintf(buff, sizeof(buff), "%4d,",
@@ -2224,9 +2137,10 @@ static ssize_t fts_doze_time_store(struct device *dev,
 	struct fts_ts_info *info = dev_get_drvdata(dev);
 
 	pr_info("%s,buf:%s,count:%zu\n", __func__, buf, count);
-	sscanf(buf, "%u", &info->doze_time);
+	if (kstrtouint(buf, 10, &info->doze_time))
+		return -EINVAL;
 	/*reg value * 10 represents of the num of frames ,one frame is about 8ms, the input value is ms*/
-	reg_val = (info->doze_time / 8 - 1) / 10;
+	reg_val = info->doze_time >= 8 ? (info->doze_time / 8 - 1) / 10 : 0;
 	cmd[3] = reg_val;
 	ret = fts_write_dma_safe(cmd, ARRAY_SIZE(cmd));
 	if (ret < OK) {
@@ -4246,11 +4160,11 @@ static int fts_enable_reg(struct fts_ts_info *info, bool enable)
 
 disable_pwr_reg:
 	if (info->avdd_reg)
-		regulator_disable(info->vdd_reg);
+		regulator_disable(info->avdd_reg);
 
 disable_bus_reg:
 	if (info->vdd_reg)
-		regulator_disable(info->avdd_reg);
+		regulator_disable(info->vdd_reg);
 
 exit:
 	return retval;
@@ -4522,26 +4436,20 @@ static void fts_switch_mode_work(struct work_struct *work)
 	struct fts_ts_info *info = ms->info;
 	unsigned char value = ms->mode;
 	static const char *fts_gesture_on = "01 20";
-	char *gesture_result;
-	int size = 6 * 2 + 1;
+	char gesture_result[16];
 
 	if (value >= INPUT_EVENT_WAKUP_MODE_OFF
 	    && value <= INPUT_EVENT_WAKUP_MODE_ON) {
 		info->gesture_enabled = value - INPUT_EVENT_WAKUP_MODE_OFF;
 		if (info->gesture_enabled) {
-			gesture_result = (u8 *) kzalloc(size, GFP_KERNEL);
-			if (gesture_result != NULL) {
-				fts_gesture_mask_store(info->dev, NULL,
-						       fts_gesture_on,
-						       strlen(fts_gesture_on));
-				fts_gesture_mask_show(info->dev, NULL,
-						      gesture_result);
-				if (strncmp
-				    ("{ 00000000 }", gesture_result, size - 1))
-					pr_err("%s: store gesture mask error\n", __func__);
-				kfree(gesture_result);
-				gesture_result = NULL;
-			}
+			memset(gesture_result, 0, sizeof(gesture_result));
+			fts_gesture_mask_store(info->dev, NULL,
+					       fts_gesture_on,
+					       strlen(fts_gesture_on));
+			fts_gesture_mask_show(info->dev, NULL,
+					      gesture_result);
+			if (strncmp("{ 00000000 }", gesture_result, 12))
+				pr_err("%s: store gesture mask error\n", __func__);
 		}
 	} else if (value >= INPUT_EVENT_COVER_MODE_OFF
 		   && value <= INPUT_EVENT_COVER_MODE_ON) {
@@ -4712,43 +4620,39 @@ static int fts_i2c_test(void)
 static ssize_t fts_selftest_read(struct file *file, char __user *buf,
 				 size_t count, loff_t *pos)
 {
-	char tmp[5] = { 0 };
+	char tmp[16];
 	int cnt;
 
-	if (*pos != 0)
-		return 0;
-	cnt =
-	    snprintf(tmp, sizeof(fts_info->result_type), "%d\n",
-		     fts_info->result_type);
-	if (copy_to_user(buf, tmp, strlen(tmp))) {
-		return -EFAULT;
-	}
-	*pos += cnt;
-	return cnt;
+	if (!fts_info)
+		return -ENODEV;
+
+	cnt = scnprintf(tmp, sizeof(tmp), "%d\n", fts_info->result_type);
+	return simple_read_from_buffer(buf, count, pos, tmp, cnt);
 }
 
 static ssize_t fts_selftest_write(struct file *file, const char __user *buf,
 				  size_t count, loff_t *pos)
 {
 	int retval = 0;
-	char tmp[6];
+	char tmp[8];
 
-	if (copy_from_user(tmp, buf, count)) {
-		retval = -EFAULT;
-		goto out;
-	}
+	if (!fts_info)
+		return -ENODEV;
 
-	if (!strncmp("short", tmp, 5) || !strncmp("open", tmp, 4)) {
+	if (count == 0 || count >= sizeof(tmp))
+		return -EINVAL;
+
+	memset(tmp, 0, sizeof(tmp));
+	if (copy_from_user(tmp, buf, count))
+		return -EFAULT;
+
+	if (!strncmp("short", tmp, 5) || !strncmp("open", tmp, 4))
 		retval = fts_short_open_test();
-	} else if (!strncmp("i2c", tmp, 3))
+	else if (!strncmp("i2c", tmp, 3))
 		retval = fts_i2c_test();
 
 	fts_info->result_type = retval;
-out:
-	if (retval >= 0)
-		retval = count;
-
-	return retval;
+	return count;
 }
 
 static const struct file_operations fts_selftest_ops = {
@@ -4759,54 +4663,37 @@ static const struct file_operations fts_selftest_ops = {
 static ssize_t fts_datadump_read(struct file *file, char __user *buf,
 				 size_t count, loff_t *pos)
 {
-	int ret = 0, cnt1 = 0, cnt2 = 0, cnt3 = 0;
+	ssize_t ret = 0;
+	int cnt1 = 0, cnt2 = 0, cnt3 = 0;
 	char *tmp;
 
-	if (*pos != 0)
-		return 0;
+	if (!fts_info)
+		return -ENODEV;
 
-	tmp = vmalloc(PAGE_SIZE * 2);
+	tmp = vzalloc(PAGE_SIZE * 3);
 	if (tmp == NULL)
-		return 0;
-	else
-		memset(tmp, 0, PAGE_SIZE * 2);
+		return -ENOMEM;
 
 	cnt1 = fts_strength_frame_show(fts_info->dev, NULL, tmp);
-	if (cnt1 == 0) {
-		ret = 0;
+	if (cnt1 <= 0)
 		goto out;
-	}
 
-	ret = stm_fts_cmd_store(fts_info->dev, NULL, "13", 2);
-	if (ret == 0)
+	if (stm_fts_cmd_store(fts_info->dev, NULL, "13", 2) <= 0)
 		goto out;
 	cnt2 = stm_fts_cmd_show(fts_info->dev, NULL, tmp + cnt1);
-	if (cnt2 == 0) {
-		ret = 0;
+	if (cnt2 <= 0)
 		goto out;
-	}
 
-	ret = stm_fts_cmd_store(fts_info->dev, NULL, "15", 2);
-	if (ret == 0)
+	if (stm_fts_cmd_store(fts_info->dev, NULL, "15", 2) <= 0)
 		goto out;
 	cnt3 = stm_fts_cmd_show(fts_info->dev, NULL, tmp + cnt1 + cnt2);
-	if (cnt3 == 0) {
-		ret = 0;
+	if (cnt3 <= 0)
 		goto out;
-	}
 
-	if (copy_to_user(buf, tmp, cnt1 + cnt2 + cnt3))
-		ret = -EFAULT;
-
+	ret = simple_read_from_buffer(buf, count, pos, tmp, cnt1 + cnt2 + cnt3);
 out:
-	if (tmp) {
-		vfree(tmp);
-		tmp = NULL;
-	}
-	*pos += (cnt1 + cnt2 + cnt3);
-	if (ret <= 0)
-		return ret;
-	return cnt1 + cnt2 + cnt3;
+	vfree(tmp);
+	return ret;
 }
 
 static const struct file_operations fts_datadump_ops = {
@@ -4818,21 +4705,12 @@ static const struct file_operations fts_datadump_ops = {
 static ssize_t fts_fw_version_read(struct file *file, char __user *buf,
 				   size_t count, loff_t *pos)
 {
-	int cnt = 0, ret = 0;
+	int cnt;
 	char tmp[TP_INFO_MAX_LENGTH];
 
-	if (*pos != 0)
-		return 0;
-
-	cnt =
-	    snprintf(tmp, TP_INFO_MAX_LENGTH, "%x.%x\n", systemInfo.u16_fwVer,
-		     systemInfo.u16_cfgVer);
-	ret = copy_to_user(buf, tmp, cnt);
-	*pos += cnt;
-	if (ret != 0)
-		return 0;
-	else
-		return cnt;
+	cnt = scnprintf(tmp, sizeof(tmp), "%x.%x\n", systemInfo.u16_fwVer,
+			systemInfo.u16_cfgVer);
+	return simple_read_from_buffer(buf, count, pos, tmp, cnt);
 }
 
 static const struct file_operations fts_fw_version_ops = {
@@ -4842,32 +4720,25 @@ static const struct file_operations fts_fw_version_ops = {
 static ssize_t fts_lockdown_info_read(struct file *file, char __user *buf,
 				      size_t count, loff_t *pos)
 {
-	int cnt = 0, ret = 0;
+	int cnt, ret;
 	char tmp[TP_INFO_MAX_LENGTH];
 
-	if (*pos != 0)
-		return 0;
+	if (!fts_info)
+		return -ENODEV;
 
 	ret = fts_get_lockdown_info(fts_info->lockdown_info, fts_info);
 	if (ret != OK) {
 		pr_err("%s: get lockdown info error\n", __func__);
-		goto out;
+		return 0;
 	}
 
-	cnt =
-	    snprintf(tmp, TP_INFO_MAX_LENGTH,
-		     "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x\n",
-		     fts_info->lockdown_info[0], fts_info->lockdown_info[1],
-		     fts_info->lockdown_info[2], fts_info->lockdown_info[3],
-		     fts_info->lockdown_info[4], fts_info->lockdown_info[5],
-		     fts_info->lockdown_info[6], fts_info->lockdown_info[7]);
-	ret = copy_to_user(buf, tmp, cnt);
-out:
-	*pos += cnt;
-	if (ret != 0)
-		return 0;
-	else
-		return cnt;
+	cnt = scnprintf(tmp, sizeof(tmp),
+			"0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x\n",
+			fts_info->lockdown_info[0], fts_info->lockdown_info[1],
+			fts_info->lockdown_info[2], fts_info->lockdown_info[3],
+			fts_info->lockdown_info[4], fts_info->lockdown_info[5],
+			fts_info->lockdown_info[6], fts_info->lockdown_info[7]);
+	return simple_read_from_buffer(buf, count, pos, tmp, cnt);
 }
 
 static const struct file_operations fts_lockdown_info_ops = {
@@ -4959,20 +4830,7 @@ static ssize_t tpdbg_read(struct file *file, char __user *buf, size_t size,
 				\necho \"tp-sd-en\" of \"tp-sd-off\" to ctrl panel in or off sleep mode\n \
 				\necho \"tp-suspend-en\" or \"tp-suspend-off\" to ctrl panel in or off suspend status\n";
 
-	loff_t pos = *ppos;
-	int len = strlen(str);
-
-	if (pos < 0)
-		return -EINVAL;
-	if (pos >= len)
-		return 0;
-
-	if (copy_to_user(buf, str, len))
-		return -EFAULT;
-
-	*ppos = pos + len;
-
-	return len;
+	return simple_read_from_buffer(buf, size, ppos, str, strlen(str));
 }
 
 static ssize_t tpdbg_write(struct file *file, const char __user *buf,
@@ -5164,7 +5022,8 @@ static int fts_probe(struct spi_device *client)
 			pr_info("display_name: %s\n", display_name);
 			if (strncmp(display_name, "dsi_samsung", 11)) {
 				pr_err("not the right display, do not need to do probe\n");
-				return -EINVAL;
+				error = -EINVAL;
+				goto ProbeErrorExit_1;
 			}
 		}
 	}
@@ -5396,7 +5255,7 @@ static int fts_probe(struct spi_device *client)
 		pr_err("ERROR: can't get lockdown info\n");
 	else {
 		pr_debug("%s Lockdown:0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x\n",
-			 info->lockdown_info[0], info->lockdown_info[1],
+			 __func__, info->lockdown_info[0], info->lockdown_info[1],
 			 info->lockdown_info[2], info->lockdown_info[3],
 			 info->lockdown_info[4], info->lockdown_info[5],
 			 info->lockdown_info[6], info->lockdown_info[7]);
@@ -5493,21 +5352,34 @@ static int fts_probe(struct spi_device *client)
 	return OK;
 
 ProbeErrorExit_8:
-    device_destroy(info->fts_tp_class, 0x49);
-    class_destroy(info->fts_tp_class);
-    info->fts_tp_class = NULL;
+	if (info->fts_tp_class) {
+		if (!IS_ERR_OR_NULL(info->fts_touch_dev))
+			device_destroy(info->fts_tp_class, 0x49);
+		class_destroy(info->fts_tp_class);
+		info->fts_tp_class = NULL;
+	}
+#ifdef CONFIG_TOUCHSCREEN_ST_DEBUG_FS
+	debugfs_remove_recursive(info->debugfs);
+#endif
+	backlight_unregister_notifier(&info->bl_notifier);
+	fts_proc_remove();
+	sysfs_remove_group(&client->dev.kobj, &info->attrs);
+#ifndef FW_UPDATE_ON_PROBE
+	cancel_delayed_work_sync(&info->fwu_work);
+	destroy_workqueue(info->fwu_workqueue);
+#endif
 
 ProbeErrorExit_7:
 #ifdef CONFIG_SECURE_TOUCH
 		fts_secure_remove(info);
 #endif
 #ifdef CONFIG_I2C_BY_DMA
-	if (info->dma_buf)
-		kfree(info->dma_buf);
-	if (info->dma_buf->rdBuf)
+	if (info->dma_buf) {
 		kfree(info->dma_buf->rdBuf);
-	if (info->dma_buf->wrBuf)
 		kfree(info->dma_buf->wrBuf);
+		kfree(info->dma_buf);
+		info->dma_buf = NULL;
+	}
 #endif
 #ifdef CONFIG_DRM
 	drm_unregister_client(&info->notifier);
@@ -5524,6 +5396,9 @@ ProbeErrorExit_5:
 	destroy_workqueue(info->event_wq);
 
 ProbeErrorExit_4:
+	if (info->board->reset_gpio >= 0)
+		fts_gpio_setup(info->board->reset_gpio, false, 0, 0);
+	fts_gpio_setup(info->board->irq_gpio, false, 0, 0);
 	fts_enable_reg(info, false);
 
 ProbeErrorExit_2:
@@ -5552,6 +5427,18 @@ static int fts_remove(struct spi_device *client)
 
 	struct fts_ts_info *info = dev_get_drvdata(&(client->dev));
 
+	proc_remove(info->tp_lockdown_info_proc);
+	proc_remove(info->tp_selftest_proc);
+	proc_remove(info->tp_data_dump_proc);
+	proc_remove(info->tp_fw_version_proc);
+#ifdef CONFIG_TOUCHSCREEN_ST_DEBUG_FS
+	debugfs_remove_recursive(info->debugfs);
+#endif
+	if (info->fts_tp_class) {
+		device_destroy(info->fts_tp_class, 0x49);
+		class_destroy(info->fts_tp_class);
+		info->fts_tp_class = NULL;
+	}
 	fts_proc_remove();
 	/* sysfs stuff */
 	sysfs_remove_group(&client->dev.kobj, &info->attrs);
@@ -5566,14 +5453,28 @@ static int fts_remove(struct spi_device *client)
 	input_unregister_device(info->input_dev);
 
 	/* Remove the work thread */
+	flush_scheduled_work();
+	cancel_work_sync(&info->resume_work);
+	cancel_work_sync(&info->suspend_work);
 	destroy_workqueue(info->event_wq);
 #ifndef FW_UPDATE_ON_PROBE
+	cancel_delayed_work_sync(&info->fwu_work);
 	destroy_workqueue(info->fwu_workqueue);
 #endif
 
+	if (info->board->reset_gpio >= 0)
+		fts_gpio_setup(info->board->reset_gpio, false, 0, 0);
+	fts_gpio_setup(info->board->irq_gpio, false, 0, 0);
 	fts_enable_reg(info, false);
 	fts_get_reg(info, false);
 	fts_info = NULL;
+#ifdef CONFIG_I2C_BY_DMA
+	if (info->dma_buf) {
+		kfree(info->dma_buf->rdBuf);
+		kfree(info->dma_buf->wrBuf);
+		kfree(info->dma_buf);
+	}
+#endif
 #ifdef CONFIG_SECURE_TOUCH
 	fts_secure_remove(info);
 #endif

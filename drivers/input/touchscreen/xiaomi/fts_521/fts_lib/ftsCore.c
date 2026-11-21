@@ -356,12 +356,15 @@ int setScanMode(u8 mode, u8 settings)
 */
 int setFeatures(u8 feat, u8 *settings, int size)
 {
-	u8 cmd[2 + size];
+	u8 cmd[2 + 64];
 	int i = 0;
 	int ret;
-	char buff[(2 + 1) * size + 1];
+	char buff[(2 + 1) * 64 + 1];
 	int buff_len = sizeof(buff);
 	int index = 0;
+
+	if (size < 0 || size > 64)
+		return ERROR_OP_NOT_ALLOW;
 
 	pr_info("%s: Setting feature: feat = %02X !\n", __func__, feat);
 	cmd[0] = FTS_CMD_FEATURE;
@@ -395,11 +398,14 @@ int setFeatures(u8 feat, u8 *settings, int size)
 */
 int writeSysCmd(u8 sys_cmd, u8 *sett, int size)
 {
-	u8 cmd[2 + size];
+	u8 cmd[2 + 64];
 	int ret;
-	char buff[(2 + 1) * size + 1];
+	char buff[(2 + 1) * 64 + 1];
 	int buff_len = sizeof(buff);
 	int index = 0;
+
+	if (size < 0 || size > 64)
+		return ERROR_OP_NOT_ALLOW;
 
 	cmd[0] = FTS_CMD_SYSTEM;
 	cmd[1] = sys_cmd;
@@ -745,13 +751,19 @@ int readConfig(u16 offset, u8 *outBuf, int len)
  */
 int fts_disableInterrupt(void)
 {
-	if (getClient() != NULL) {
+	unsigned long flags;
+	struct i2c_client *client = getClient();
+
+	if (client != NULL) {
+		spin_lock_irqsave(&fts_int, flags);
 		pr_debug("Number of disable = %d\n", disable_irq_count);
 		if (disable_irq_count == 0) {
 			pr_debug("Executing Disable...\n");
-			disable_irq(getClient()->irq);
+			disable_irq_nosync(client->irq);
 			disable_irq_count++;
 		}
+		spin_unlock_irqrestore(&fts_int, flags);
+		synchronize_irq(client->irq);
 		pr_debug("Interrupt Disabled!\n");
 		return OK;
 	} else {
@@ -759,7 +771,6 @@ int fts_disableInterrupt(void)
 			__func__, ERROR_OP_NOT_ALLOW);
 		return ERROR_OP_NOT_ALLOW;
 	}
-
 }
 
 /**
@@ -768,16 +779,18 @@ int fts_disableInterrupt(void)
  */
 int fts_disableInterruptNoSync(void)
 {
-	if (getClient() != NULL) {
-		spin_lock_irq(&fts_int);
+	unsigned long flags;
+	struct i2c_client *client = getClient();
+
+	if (client != NULL) {
+		spin_lock_irqsave(&fts_int, flags);
 		pr_debug("Number of disable = %d\n", disable_irq_count);
 		if (disable_irq_count == 0) {
 			pr_debug("Executing Disable...\n");
-			disable_irq_nosync(getClient()->irq);
+			disable_irq_nosync(client->irq);
 			disable_irq_count++;
 		}
-
-		spin_unlock_irq(&fts_int);
+		spin_unlock_irqrestore(&fts_int, flags);
 		pr_debug("Interrupt No Sync Disabled!\n");
 		return OK;
 	} else {
@@ -793,7 +806,11 @@ int fts_disableInterruptNoSync(void)
  */
 int fts_resetDisableIrqCount(void)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&fts_int, flags);
 	disable_irq_count = 0;
+	spin_unlock_irqrestore(&fts_int, flags);
 	return OK;
 }
 
@@ -803,13 +820,21 @@ int fts_resetDisableIrqCount(void)
  */
 int fts_enableInterrupt(void)
 {
-	if (getClient() != NULL) {
+	unsigned long flags;
+	struct i2c_client *client = getClient();
+	int count;
 
-		pr_debug("Number of re-enable = %d\n", disable_irq_count);
-		while (disable_irq_count > 0) {
+	if (client != NULL) {
+		spin_lock_irqsave(&fts_int, flags);
+		count = disable_irq_count;
+		disable_irq_count = 0;
+		spin_unlock_irqrestore(&fts_int, flags);
+
+		pr_debug("Number of re-enable = %d\n", count);
+		while (count > 0) {
 			pr_debug("Executing Enable...\n");
-			enable_irq(getClient()->irq);
-			disable_irq_count--;
+			enable_irq(client->irq);
+			count--;
 		}
 		pr_debug("Interrupt Enabled!\n");
 		return OK;
@@ -1187,13 +1212,15 @@ int readLockDownInfo(u8 *lockData, u8 lock_id, int size)
 			memcpy(lockData, &temp[LOCKDOWN_DATA_OFFSET], size);
 			break;
 		}
-
+		ret = ERROR_LOCKDOWN_CODE;
 	}
 
-	datatemp = printHex_data("Lockdown Code = ", lockData, size);
-	if (datatemp != NULL) {
-		pr_info("%s: %s", __func__, datatemp);
-		kfree(datatemp);
+	if (ret == OK) {
+		datatemp = printHex_data("Lockdown Code = ", lockData, size);
+		if (datatemp != NULL) {
+			pr_info("%s: %s", __func__, datatemp);
+			kfree(datatemp);
+		}
 	}
 
 END:
@@ -1285,13 +1312,15 @@ int fts_get_lockdown_info(u8 *lockData, struct fts_ts_info *info)
 			memcpy(lockData, &temp[LOCKDOWN_DATA_OFFSET], size);
 			break;
 		}
-
+		ret = ERROR_LOCKDOWN_CODE;
 	}
 
-	datatemp = printHex_data("Lockdown Code = ", lockData, size);
-	if (datatemp != NULL) {
-		pr_info("%s %s", __func__, datatemp);
-		kfree(datatemp);
+	if (ret == OK) {
+		datatemp = printHex_data("Lockdown Code = ", lockData, size);
+		if (datatemp != NULL) {
+			pr_info("%s %s", __func__, datatemp);
+			kfree(datatemp);
+		}
 	}
 
 END:
