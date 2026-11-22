@@ -275,7 +275,8 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 	} else if (drm_dev && drm_dev->doze_state == DRM_BLANK_LP2) {
 		DSI_ERR("unable to set doze backlight in LP2 state:%u\n", (u32)bl_temp);
 	} else {
-		drm_dev->doze_brightness = DOZE_BRIGHTNESS_INVALID;
+		if (drm_dev)
+			drm_dev->doze_brightness = DOZE_BRIGHTNESS_INVALID;
 		rc = dsi_panel_set_backlight(panel, (u32)bl_temp);
 		if (rc)
 			DSI_ERR("unable to set backlight\n");
@@ -984,6 +985,13 @@ int dsi_display_read_panel(struct dsi_panel *panel, struct dsi_read_config *read
 	}
 	flags |= (DSI_CTRL_CMD_FETCH_MEMORY | DSI_CTRL_CMD_READ);
 
+	if (read_config->cmds_rlen > sizeof(read_config->rbuf)) {
+		DSI_ERR("read length %u exceeds rbuf size\n",
+			read_config->cmds_rlen);
+		rc = -EINVAL;
+		goto exit;
+	}
+
 	memset(read_config->rbuf, 0x0, sizeof(read_config->rbuf));
 	cmds->msg.rx_buf = read_config->rbuf;
 	cmds->msg.rx_len = read_config->cmds_rlen;
@@ -1048,6 +1056,10 @@ int dsi_display_read_cmd(struct dsi_panel *panel, u32 packet_count,
 		rc = -ENOMEM;
 		goto error;
 	} else {
+		if (!data || length < 7) {
+			rc = -EINVAL;
+			goto error_free_mem;
+		}
 		read_cmd->count = packet_count;
 		read_cmd->ctrl_idx = 0;
 		cmds = read_cmd->cmds;
@@ -1062,6 +1074,7 @@ int dsi_display_read_cmd(struct dsi_panel *panel, u32 packet_count,
 			size = cmds[i].msg.tx_len * sizeof(u8);
 			if (size > length - 7) {
 				pr_info("payload size is larger than length(%d)\n", length);
+				rc = -EINVAL;
 				goto error_free_mem;
 			}
 			payload = kzalloc(size, GFP_KERNEL);
@@ -5722,7 +5735,7 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 	boot_disp->node = pdev->dev.of_node;
 	boot_disp->disp = display;
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
-	pr_info("boot display name is %s\n", boot_disp->disp);
+	pr_info("boot display name is %s\n", boot_disp->name);
 #endif
 
 	display->panel_node = panel_node;

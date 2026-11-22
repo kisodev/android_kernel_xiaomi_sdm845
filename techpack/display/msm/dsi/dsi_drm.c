@@ -215,11 +215,31 @@ static int dsi_bridge_attach(struct drm_bridge *bridge)
 static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	int rc = 0;
-	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+	struct dsi_bridge *c_bridge;
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
-	struct drm_device *dev = bridge->dev;
-	struct sde_connector *c_conn = to_sde_connector(c_bridge->display->drm_conn);
+	struct drm_device *dev;
+	struct sde_connector *c_conn;
 	int event = 0;
+#endif
+
+	if (!bridge) {
+		DSI_ERR("Invalid params\n");
+		return;
+	}
+
+	c_bridge = to_dsi_bridge(bridge);
+	if (!c_bridge || !c_bridge->display || !c_bridge->display->panel) {
+		DSI_ERR("Incorrect bridge details\n");
+		return;
+	}
+
+#if defined(CONFIG_MACH_XIAOMI_SDM845)
+	dev = bridge->dev;
+	if (!dev || !c_bridge->display->drm_conn) {
+		DSI_ERR("Invalid drm device or connector\n");
+		return;
+	}
+	c_conn = to_sde_connector(c_bridge->display->drm_conn);
 
 	if (dev->doze_state == DRM_BLANK_POWERDOWN) {
 		dev->doze_state = DRM_BLANK_UNBLANK;
@@ -229,16 +249,6 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 	event = dev->doze_state;
 	g_notify_data.data = &event;
 #endif
-
-	if (!bridge) {
-		DSI_ERR("Invalid params\n");
-		return;
-	}
-
-	if (!c_bridge || !c_bridge->display || !c_bridge->display->panel) {
-		DSI_ERR("Incorrect bridge details\n");
-		return;
-	}
 
 	if (bridge->encoder->crtc->state->active_changed)
 		atomic_set(&c_bridge->display->panel->esd_recovery_pending, 0);
@@ -360,6 +370,9 @@ int dsi_bridge_interface_enable(int timeout)
 		return -ETIMEDOUT;
 	}
 
+	if (!gbridge || !gbridge->base.dev)
+		return -ENODEV;
+
 	mutex_lock(&gbridge->base.lock);
 
 	if (atomic_read(&prim_panel_is_on)) {
@@ -437,13 +450,13 @@ static int dsi_bridge_get_panel_info(struct drm_bridge *bridge, char *buf)
 	int rc = 0;
 	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
 
-	if (!c_bridge) {
+	if (!c_bridge || !c_bridge->display) {
 		DSI_ERR("Invalid params\n");
 		return rc;
 	}
 
 	if (c_bridge->display->name)
-		return snprintf(buf, PAGE_SIZE, c_bridge->display->name);
+		return snprintf(buf, PAGE_SIZE, "%s", c_bridge->display->name);
 
 	return rc;
 }
@@ -513,10 +526,29 @@ static void dsi_bridge_disable(struct drm_bridge *bridge)
 static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 {
 	int rc = 0;
-	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+	struct dsi_bridge *c_bridge;
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
-	struct drm_device *dev = bridge->dev;
+	struct drm_device *dev;
 	int event = 0;
+#endif
+
+	if (!bridge) {
+		DSI_ERR("Invalid params\n");
+		return;
+	}
+
+	c_bridge = to_dsi_bridge(bridge);
+	if (!c_bridge || !c_bridge->display) {
+		DSI_ERR("Incorrect bridge details\n");
+		return;
+	}
+
+#if defined(CONFIG_MACH_XIAOMI_SDM845)
+	dev = bridge->dev;
+	if (!dev) {
+		DSI_ERR("Invalid drm device\n");
+		return;
+	}
 
 	if (dev->doze_state == DRM_BLANK_UNBLANK) {
 		dev->doze_state = DRM_BLANK_POWERDOWN;
@@ -526,11 +558,6 @@ static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 	event = dev->doze_state;
 	g_notify_data.data = &event;
 #endif
-
-	if (!bridge) {
-		DSI_ERR("Invalid params\n");
-		return;
-	}
 
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 	if (c_bridge->display->is_prim_display && !atomic_read(&prim_panel_is_on)) {
@@ -572,7 +599,7 @@ static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 	drm_notifier_call_chain(DRM_EVENT_BLANK, &g_notify_data);
 
-	if (gbridge)
+	if (gbridge && gbridge->base.dev)
 		gbridge->base.dev->fp_quickon = false;
 
 	if (c_bridge->display->is_prim_display)
@@ -583,6 +610,9 @@ static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 static void prim_panel_off_delayed_work(struct work_struct *work)
 {
+	if (!gbridge || !gbridge->base.dev)
+		return;
+
 	mutex_lock(&gbridge->base.lock);
 	if (atomic_read(&prim_panel_is_on)) {
 		dsi_bridge_post_disable(&gbridge->base);
@@ -1374,6 +1404,7 @@ void dsi_drm_bridge_cleanup(struct dsi_bridge *bridge)
 
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 	if (bridge == gbridge) {
+		gbridge = NULL;
 		atomic_set(&prim_panel_is_on, false);
 		cancel_delayed_work_sync(&prim_panel_work);
 		wakeup_source_remove(prim_panel_wakelock);
