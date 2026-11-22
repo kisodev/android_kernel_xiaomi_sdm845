@@ -32,9 +32,6 @@
 #include <linux/printk.h>
 #include "bbd.h"
 
-// function to inject sensor data into SHMD
-ssize_t bbd_sensor_write(const char *buf, unsigned int size);
-void bcm_on_packet_received(void *_priv, unsigned char *data, size_t size);
 #else
 
 //self-test with built-in main()
@@ -366,12 +363,20 @@ static int BbdBridge_OnRpcReceived(unsigned short usRpcId,
 	if (usRpcId == RPC_DEFINITION(IRpcSensorResponse, Data)) {
 		/* Read 2 byte size */
 		ssize_t result;
-		unsigned short size = *pRpcPayload++;
+		unsigned short size;
+
+		if (usRpcLen < 2)
+			return 1;
+
+		size = *pRpcPayload++;
 		size |= *pRpcPayload++ << 8;
+		if (size != usRpcLen - 2) {
+			WARN_ON(1);
+			return 1;
+		}
 
 		result = bbd_sensor_write(pRpcPayload, size);
-		WARN_ON(size != usRpcLen-2);
-		WARN_ON((short) result != size);
+		WARN_ON(result != size);
 
 		return 1;
 	}
@@ -393,18 +398,26 @@ static bool BbdBridge_CheckPacketSanity(unsigned char *pucData,
 		lSize--;
 
 		if (usRpcId&0x80) {
+			if (lSize <= 0)
+				return false;
 			usRpcId &= ~0x80;
 			usRpcId <<= 8;
 			usRpcId |= *pucData++; lSize--;
 		}
 
+		if (lSize <= 0)
+			return false;
 		usRpcLen = *pucData++; lSize--;
 		if (usRpcLen&0x80) {
+			if (lSize <= 0)
+				return false;
 			usRpcLen &= ~0x80;
 			usRpcLen <<= 8;
 			usRpcLen |= *pucData++; lSize--;
 		}
 
+		if (usRpcLen > lSize)
+			return false;
 		pucData += usRpcLen;
 		lSize -= usRpcLen;
 	}
@@ -649,12 +662,9 @@ static bool TransportLayer_PacketReceived(void *priv)
 						/* everything good, notify upper layer that we have
 						 * the payload of a packet available
 						   In case of sensor data, we don't want send it to lhd! */
-							if (!BbdBridge_OnPacketReceived(pucData, usLen))
+						if (!BbdBridge_OnPacketReceived(pucData, usLen))
 							bcm_on_packet_received(priv, m_aucRxEscapedBuf, m_uiEscLen);
 					}
-				} else {
-						//pr_info("[SSPBBD]: %s :%d\n", __func__, __LINE__);
-						bcm_on_packet_received(priv, m_aucRxEscapedBuf, m_uiEscLen);
 				}
 				return true;
 			}
@@ -709,12 +719,14 @@ void bbd_parse_asic_data(unsigned char *pucData,
 						m_uiRxLen = 0;
 					} else {
 						if (ucData != ESCAPE_CHARACTER) {
+							m_uiEscLen = 0;
 							m_uiParserState = WAIT_FOR_ESC_SOP;
 						} else {
+							m_aucRxEscapedBuf[0] = ESCAPE_CHARACTER;
+							m_uiEscLen = 1;
 							m_otCurrentStats.ulRxGarbageBytes += 2;
 							m_ulByteCntSinceLastValidPacket = 1;
 						}
-
 					}
 				}
 				break;
@@ -726,6 +738,7 @@ void bbd_parse_asic_data(unsigned char *pucData,
 					} else if (m_uiRxLen < sizeof(m_aucRxMessageBuf)) {
 						m_aucRxMessageBuf[m_uiRxLen++] = ucData;
 					} else {
+						m_uiEscLen = 0;
 						m_uiParserState = WAIT_FOR_ESC_SOP;
 					}
 				}
@@ -745,6 +758,7 @@ void bbd_parse_asic_data(unsigned char *pucData,
 							m_aucRxMessageBuf[m_uiRxLen++] = ESCAPE_CHARACTER;
 							m_uiParserState = WAIT_FOR_MESSAGE_COMPLETE;
 						} else {
+							m_uiEscLen = 0;
 							m_uiParserState = WAIT_FOR_ESC_SOP;
 						}
 					} else if (ucData == ESCAPED_XON_CHARACTER) {
@@ -752,6 +766,7 @@ void bbd_parse_asic_data(unsigned char *pucData,
 							m_aucRxMessageBuf[m_uiRxLen++] = XON_CHARACTER;
 							m_uiParserState = WAIT_FOR_MESSAGE_COMPLETE;
 						} else {
+							m_uiEscLen = 0;
 							m_uiParserState = WAIT_FOR_ESC_SOP;
 						}
 					} else if (ucData == ESCAPED_XOFF_CHARACTER) {
@@ -759,6 +774,7 @@ void bbd_parse_asic_data(unsigned char *pucData,
 							m_aucRxMessageBuf[m_uiRxLen++] = XOFF_CHARACTER;
 							m_uiParserState = WAIT_FOR_MESSAGE_COMPLETE;
 						} else {
+							m_uiEscLen = 0;
 							m_uiParserState = WAIT_FOR_ESC_SOP;
 						}
 					} else if (ucData == (SOP_CHARACTER - 1)) {
@@ -775,8 +791,11 @@ void bbd_parse_asic_data(unsigned char *pucData,
 						// garbage, any extra is garbage
 						m_ulByteCntSinceLastValidPacket = 2;
 					} else if (ucData == ESCAPE_CHARACTER) {
+						m_aucRxEscapedBuf[0] = ESCAPE_CHARACTER;
+						m_uiEscLen = 1;
 						m_uiParserState = WAIT_FOR_SOP;
 					} else {
+						m_uiEscLen = 0;
 						m_uiParserState = WAIT_FOR_ESC_SOP;
 					}
 				}

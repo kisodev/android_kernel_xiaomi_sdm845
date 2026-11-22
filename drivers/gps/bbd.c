@@ -174,15 +174,25 @@ struct sensor_pkt {
 	unsigned short size;
 	unsigned char buf[1022];	/*We assume max SSP packet less than 1KB */
 } __attribute__((__packed__)) ss_pkt;
+static DEFINE_MUTEX(ss_pkt_lock);
 
 ssize_t bbd_send_packet(unsigned char *buf, size_t size)
 {
+	ssize_t ret;
+
+	if (!buf || size > sizeof(ss_pkt.buf))
+		return -EINVAL;
+
+	mutex_lock(&ss_pkt_lock);
 	memset(&ss_pkt, 0, sizeof(ss_pkt));
 	ss_pkt.size = (unsigned short)size;
 	memcpy(ss_pkt.buf, buf, size);
 
-	return bbd_on_read(BBD_MINOR_SENSOR,
-					(unsigned char *)&ss_pkt, size+2); /* +2 for pkt.size */
+	ret = bbd_on_read(BBD_MINOR_SENSOR,
+			  (unsigned char *)&ss_pkt, size + 2); /* +2 for pkt.size */
+	mutex_unlock(&ss_pkt_lock);
+
+	return ret;
 }
 EXPORT_SYMBOL(bbd_send_packet);
 
@@ -206,8 +216,8 @@ ssize_t bbd_pull_packet(unsigned char *buf, size_t size,
 	struct circ_buf *circ = &bbd.priv[BBD_MINOR_SHMD].read_buf;
 	size_t rd_size = 0;
 
-	WARN_ON(!buf);
-	WARN_ON(!size);
+	if (!buf || !size)
+		return -EINVAL;
 
 	if (timeout_ms) {
 		int ret = wait_event_interruptible_timeout(
@@ -216,6 +226,8 @@ ssize_t bbd_pull_packet(unsigned char *buf, size_t size,
 					msecs_to_jiffies(timeout_ms));
 		if (!ret)
 			return -ETIMEDOUT;
+		if (ret < 0)
+			return ret;
 	}
 
 	mutex_lock(&bbd.priv[BBD_MINOR_SHMD].lock);
@@ -224,17 +236,16 @@ ssize_t bbd_pull_packet(unsigned char *buf, size_t size,
 	 * Because SHMD's buffer is linear, we may require 2
 	 * copies from [tail..end] and [start..head]
 	 */
-	do {
+	while (size > 0 && CIRC_CNT(circ->head, circ->tail, BBD_BUFF_SIZE)) {
 		size_t cnt_to_end = CIRC_CNT_TO_END(circ->head,
-											circ->tail, BBD_BUFF_SIZE);
+						    circ->tail, BBD_BUFF_SIZE);
 		size_t copied = min(cnt_to_end, size);
 
 		memcpy(buf + rd_size, (void *) circ->buf + circ->tail, copied);
 		size -= copied;
 		rd_size += copied;
 		circ->tail = (circ->tail + copied) & (BBD_BUFF_SIZE - 1);
-
-	} while (size > 0 && CIRC_CNT(circ->head, circ->tail, BBD_BUFF_SIZE));
+	}
 
 	mutex_unlock(&bbd.priv[BBD_MINOR_SHMD].lock);
 
@@ -273,26 +284,35 @@ EXPORT_SYMBOL(bbd_mcu_reset);
  */
 ssize_t bbd_control(const char *buf, ssize_t len)
 {
-	printk("%s : %s \n", __func__, buf);
+	if (!buf || len <= 0)
+		return -EINVAL;
 
-	if (strnstr(buf, ESW_CTRL_READY, strlen(buf))) {
+	printk("%s : %.*s \n", __func__, (int)len, buf);
+
+	if (strnstr(buf, ESW_CTRL_READY, len)) {
 
 		if (bbd.ssp_cb && bbd.ssp_cb->on_mcu_ready)
 			bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, true);
 #ifdef CONFIG_BCM_GPS_SPI_DRIVER
 		bcm477x_debug_info(ESW_CTRL_READY);
 #endif
-	} else if (strnstr(buf, ESW_CTRL_NOTREADY, strlen(buf))) {
+	} else if (strnstr(buf, ESW_CTRL_NOTREADY, len)) {
 		struct circ_buf *circ = &bbd.priv[BBD_MINOR_SENSOR].read_buf;
+
+		mutex_lock(&bbd.priv[BBD_MINOR_SENSOR].lock);
 		circ->head = circ->tail = 0;
+		mutex_unlock(&bbd.priv[BBD_MINOR_SENSOR].lock);
 		if (bbd.ssp_cb && bbd.ssp_cb->on_mcu_ready)
 			bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, false);
 #ifdef CONFIG_BCM_GPS_SPI_DRIVER
 		bcm477x_debug_info(ESW_CTRL_NOTREADY);
 #endif
-	} else if (strnstr(buf, ESW_CTRL_CRASHED, strlen(buf))) {
+	} else if (strnstr(buf, ESW_CTRL_CRASHED, len)) {
 		struct circ_buf *circ = &bbd.priv[BBD_MINOR_SENSOR].read_buf;
+
+		mutex_lock(&bbd.priv[BBD_MINOR_SENSOR].lock);
 		circ->head = circ->tail = 0;
+		mutex_unlock(&bbd.priv[BBD_MINOR_SENSOR].lock);
 
 		if (bbd.ssp_cb && bbd.ssp_cb->on_mcu_ready)
 			bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, false);
@@ -303,31 +323,31 @@ ssize_t bbd_control(const char *buf, ssize_t len)
 		bcm477x_debug_info(ESW_CTRL_CRASHED);
 #endif
 #if 0
-	} else if (strnstr(buf, BBD_CTRL_DEBUG_ON, strlen(buf))) {
+	} else if (strnstr(buf, BBD_CTRL_DEBUG_ON, len)) {
 		bbd.db = true;
 #endif
-	} else if (strnstr(buf, BBD_CTRL_DEBUG_OFF, strlen(buf))) {
+	} else if (strnstr(buf, BBD_CTRL_DEBUG_OFF, len)) {
 		bbd.db = false;
 #ifdef CONFIG_SENSORS_SSP
-	} else if (strnstr(buf, SSP_DEBUG_ON, strlen(buf))) {
+	} else if (strnstr(buf, SSP_DEBUG_ON, len)) {
 		ssp_dbg = true;
 		ssp_pkt_dbg = true;
-	} else if (strnstr(buf, SSP_DEBUG_OFF, strlen(buf))) {
+	} else if (strnstr(buf, SSP_DEBUG_OFF, len)) {
 		ssp_dbg = false;
 		ssp_pkt_dbg = false;
 #endif
 #ifdef CONFIG_BCM_GPS_SPI_DRIVER
-	} else if (strnstr(buf, SSI_DEBUG_ON, strlen(buf))) {
+	} else if (strnstr(buf, SSI_DEBUG_ON, len)) {
 		ssi_dbg = true;
-	} else if (strnstr(buf, SSI_DEBUG_OFF, strlen(buf))) {
+	} else if (strnstr(buf, SSI_DEBUG_OFF, len)) {
 		ssi_dbg = false;
-	} else if (strnstr(buf, PZC_DEBUG_ON, strlen(buf))) {
+	} else if (strnstr(buf, PZC_DEBUG_ON, len)) {
 		ssi_dbg_pzc = true;
-	} else if (strnstr(buf, PZC_DEBUG_OFF, strlen(buf))) {
+	} else if (strnstr(buf, PZC_DEBUG_OFF, len)) {
 		ssi_dbg_pzc = false;
-	} else if (strnstr(buf, RNG_DEBUG_ON, strlen(buf))) {
+	} else if (strnstr(buf, RNG_DEBUG_ON, len)) {
 		ssi_dbg_rng = true;
-	} else if (strnstr(buf, RNG_DEBUG_OFF, strlen(buf))) {
+	} else if (strnstr(buf, RNG_DEBUG_OFF, len)) {
 		ssi_dbg_rng = false;
 #endif
 	} else if (bbd.ssp_cb && bbd.ssp_cb->on_control) {
@@ -353,7 +373,7 @@ ssize_t bbd_control(const char *buf, ssize_t len)
 int bbd_common_open(struct inode *inode, struct file *filp)
 {
 	unsigned int minor = iminor(inode);
-	struct circ_buf *circ = &bbd.priv[minor].read_buf;
+	struct circ_buf *circ;
 
 	pr_info("%s++\n", __func__);
 
@@ -362,13 +382,18 @@ int bbd_common_open(struct inode *inode, struct file *filp)
 
 	pr_info("%s", bbd.priv[minor].name);
 
-	if (bbd.priv[minor].busy && minor != BBD_MINOR_CONTROL)
+	mutex_lock(&bbd.priv[minor].lock);
+	if (bbd.priv[minor].busy && minor != BBD_MINOR_CONTROL) {
+		mutex_unlock(&bbd.priv[minor].lock);
 		return -EBUSY;
+	}
 
 	bbd.priv[minor].busy = true;
 
 	/* Reset circ buffer */
+	circ = &bbd.priv[minor].read_buf;
 	circ->head = circ->tail = 0;
+	mutex_unlock(&bbd.priv[minor].lock);
 
 	filp->private_data = &bbd;
 
@@ -382,14 +407,16 @@ int bbd_common_open(struct inode *inode, struct file *filp)
 static int bbd_common_release(struct inode *inode, struct file *filp)
 {
 	unsigned int minor = iminor(inode);
-	//struct bbd_device *bbd = filp->private_data;
 
 	pr_info("%s++\n", __func__);
 
-	BUG_ON(minor >= BBD_DEVICE_INDEX);
+	if (minor >= BBD_DEVICE_INDEX)
+		return -ENODEV;
 	pr_info("%s", bbd.priv[minor].name);
 
+	mutex_lock(&bbd.priv[minor].lock);
 	bbd.priv[minor].busy = false;
+	mutex_unlock(&bbd.priv[minor].lock);
 
 	pr_info("%s--\n", __func__);
 	return 0;
@@ -402,38 +429,41 @@ static int bbd_common_release(struct inode *inode, struct file *filp)
  *
  */
 static ssize_t bbd_common_read(struct file *filp,
-							   char __user *buf, size_t size, loff_t *ppos)
+			       char __user *buf, size_t size, loff_t *ppos)
 {
 	unsigned int minor = iminor(filp->f_path.dentry->d_inode);
-	//struct bbd_device *bbd = filp->private_data;
-	struct circ_buf *circ = &bbd.priv[minor].read_buf;
+	struct circ_buf *circ;
 	size_t rd_size = 0;
 
 	pr_info("%s++\n", __func__);
-	BUG_ON(minor >= BBD_DEVICE_INDEX);
+	if (minor >= BBD_DEVICE_INDEX)
+		return -ENODEV;
 
+	circ = &bbd.priv[minor].read_buf;
 	mutex_lock(&bbd.priv[minor].lock);
 
 	/* Copy from circ buffer to lhd
 	 * Because lhd's buffer is linear,
 	 * we may require 2 copies from [tail..end] and [end..head]
 	 */
-	do {
+	while (size > 0 && CIRC_CNT(circ->head, circ->tail, BBD_BUFF_SIZE)) {
 		size_t cnt_to_end = CIRC_CNT_TO_END(circ->head,
-											circ->tail, BBD_BUFF_SIZE);
+						    circ->tail, BBD_BUFF_SIZE);
 		size_t copied = min(cnt_to_end, size);
 
-		WARN_ON(copy_to_user(buf + rd_size,
-							(void *) circ->buf + circ->tail, copied));
+		if (copy_to_user(buf + rd_size,
+				 (void *)circ->buf + circ->tail, copied)) {
+			mutex_unlock(&bbd.priv[minor].lock);
+			return rd_size ? rd_size : -EFAULT;
+		}
+		bbd_log_hex(bbd_dev_name[minor],
+			    (const unsigned char *)circ->buf + circ->tail, copied);
 		size -= copied;
 		rd_size += copied;
 		circ->tail = (circ->tail + copied) & (BBD_BUFF_SIZE - 1);
-
-	} while (size > 0 && CIRC_CNT(circ->head, circ->tail, BBD_BUFF_SIZE));
+	}
 
 	mutex_unlock(&bbd.priv[minor].lock);
-
-	bbd_log_hex(bbd_dev_name[minor], buf, rd_size);
 
 	pr_info("%s--\n", __func__);
 	return rd_size;
@@ -445,15 +475,19 @@ static ssize_t bbd_common_read(struct file *filp,
  *
  */
 static ssize_t bbd_common_write(struct file *filp,
-								const char __user *buf, size_t size,
-								loff_t *ppos)
+				const char __user *buf, size_t size,
+				loff_t *ppos)
 {
 	unsigned int minor = iminor(filp->f_path.dentry->d_inode);
-	//struct bbd_device *bbd = filp->private_data;
 
-	BUG_ON(size >= BBD_BUFF_SIZE);
+	if (minor >= BBD_DEVICE_INDEX)
+		return -ENODEV;
+	if (size >= BBD_BUFF_SIZE)
+		return -EINVAL;
 
-	WARN_ON(copy_from_user(bbd.priv[minor].write_buf, buf, size));
+	if (copy_from_user(bbd.priv[minor].write_buf, buf, size))
+		return -EFAULT;
+	bbd.priv[minor].write_buf[size] = '\0';
 
 	return size;
 }
@@ -465,12 +499,13 @@ static ssize_t bbd_common_write(struct file *filp,
 static unsigned int bbd_common_poll(struct file *filp, poll_table *wait)
 {
 	unsigned int minor = iminor(filp->f_path.dentry->d_inode);
-	//struct bbd_device *bbd = filp->private_data;
-	struct circ_buf *circ = &bbd.priv[minor].read_buf;
+	struct circ_buf *circ;
 	unsigned int mask = 0;
 
-	BUG_ON(minor >= BBD_DEVICE_INDEX);
+	if (minor >= BBD_DEVICE_INDEX)
+		return POLLERR;
 
+	circ = &bbd.priv[minor].read_buf;
 	poll_wait(filp, &bbd.priv[minor].poll_wait, wait);
 
 	if (CIRC_CNT(circ->head, circ->tail, BBD_BUFF_SIZE))
@@ -496,19 +531,21 @@ static unsigned int bbd_common_poll(struct file *filp, poll_table *wait)
  */
 ssize_t bbd_sensor_write(const char *buf, size_t size)
 {
+	if (!buf)
+		return -EINVAL;
+
 	/* Copies into /dev/bbd_shmd.
-	*  If SHMD was sleeping in poll_wait, bbd_on_read() wakes it up also */
+	 * If SHMD was sleeping in poll_wait, bbd_on_read() wakes it up also */
 	bbd_on_read(BBD_MINOR_SHMD, buf, size);
 
 	/* OK. Now call pre-registered SHMD callbacks */
-	if (bbd.ssp_cb->on_packet)
-		bbd.ssp_cb->on_packet(bbd.ssp_priv,
-							  bbd.priv[BBD_MINOR_SHMD].write_buf, size);
-	else if (bbd.ssp_cb->on_packet_alarm)
+	if (bbd.ssp_cb && bbd.ssp_cb->on_packet)
+		bbd.ssp_cb->on_packet(bbd.ssp_priv, buf, size);
+	else if (bbd.ssp_cb && bbd.ssp_cb->on_packet_alarm)
 		bbd.ssp_cb->on_packet_alarm(bbd.ssp_priv);
 	else
 		pr_err("%s no SSP on_packet callback registered. "
-				"Dropped %u bytes\n", __func__, (unsigned int)size);
+		       "Dropped %u bytes\n", __func__, (unsigned int)size);
 
 	return size;
 }
@@ -543,6 +580,9 @@ ssize_t bbd_patch_read(struct file *filp, char __user *buf,
 	unsigned char *curr_bbd_patch;
 	size_t bbd_patch_sz;
 
+	if (!bbd)
+		return -ENODEV;
+
 	if (bbd->legacy_patch) {
 		curr_bbd_patch = legacy_bbd_patch;
 		bbd_patch_sz = sizeof(legacy_bbd_patch);
@@ -555,7 +595,7 @@ ssize_t bbd_patch_read(struct file *filp, char __user *buf,
 		*ppos = 0;
 		return 0;
 	}
-	if (offset+size > bbd_patch_sz)
+	if (size > bbd_patch_sz - offset)
 		rd_size = bbd_patch_sz - offset;
 	if (copy_to_user(buf, curr_bbd_patch + offset, rd_size))
 		rd_size = -EFAULT;
@@ -574,7 +614,7 @@ static ssize_t store_sysfs_bbd_control(struct device *dev,
 									   struct device_attribute *attr,
 									   const char *buf, size_t len)
 {
-	bbd_control(buf, strlen(buf)+1);
+	bbd_control(buf, len);
 	return len;
 }
 
@@ -691,9 +731,10 @@ ssize_t bbd_request_mcu(bool on)
 		return bbd_on_read(BBD_MINOR_CONTROL,
 						   GPSD_SENSOR_ON, strlen(GPSD_SENSOR_ON)+1);
 	else {
-		bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, false);
+		if (bbd.ssp_cb && bbd.ssp_cb->on_mcu_ready)
+			bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, false);
 		return bbd_on_read(BBD_MINOR_CONTROL,
-						   GPSD_SENSOR_OFF, strlen(GPSD_SENSOR_OFF)+1);
+				   GPSD_SENSOR_OFF, strlen(GPSD_SENSOR_OFF) + 1);
 	}
 }
 EXPORT_SYMBOL(bbd_request_mcu);
@@ -722,7 +763,7 @@ static int bbd_resume(void)
 {
 #ifdef CONFIG_SENSORS_SSP
 	/* Call SSP resume */
-	if (pssp_driver->driver.pm && pssp_driver->driver.pm->suspend)
+	if (pssp_driver->driver.pm && pssp_driver->driver.pm->resume)
 		pssp_driver->driver.pm->resume(&dummy_spi.dev);
 #endif
 
@@ -812,93 +853,93 @@ int bbd_init(struct device *dev, bool legacy_patch)
 	ts1 = ktime_to_timespec(ktime_get_boottime());
 	start = ts1.tv_sec * 1000000000ULL + ts1.tv_nsec;
 
-
 	/* Initialize BBD device */
 	memset(&bbd, 0, sizeof(bbd));
 
 	bbd.legacy_patch = legacy_patch;
 
+	for (minor = 0; minor < BBD_DEVICE_INDEX; minor++) {
+		bbd.priv[minor].name = bbd_dev_name[minor];
+		bbd.priv[minor].read_buf.buf = bbd.priv[minor]._read_buf;
+		init_waitqueue_head(&bbd.priv[minor].poll_wait);
+		mutex_init(&bbd.priv[minor].lock);
+	}
+
 	/* Create class which is required for device_create() */
 	bbd.class = class_create(THIS_MODULE, "bbd");
 	if (IS_ERR(bbd.class)) {
-		WARN("BBD:%s() failed to create class \"bbd\"", __func__);
-		goto exit;
+		ret = PTR_ERR(bbd.class);
+		pr_err("BBD:%s() failed to create class \"bbd\", ret=%d", __func__, ret);
+		goto free_mutexes;
+	}
+
+	ret = alloc_chrdev_region(&devno, 0, BBD_DEVICE_INDEX, "bbd");
+	if (ret) {
+		pr_err("BBD:%s() failed to alloc_chrdev_region(), ret=%d",
+		       __func__, ret);
+		goto free_class;
 	}
 
 	/* Create BBD char devices */
 	for (minor = 0; minor < BBD_DEVICE_INDEX; minor++) {
-		//dev_t devno = MKDEV(BBD_DEVICE_MAJOR, minor);
+		dev_t cur_dev = MKDEV(MAJOR(devno), MINOR(devno) + minor);
 		struct cdev *cdev = &bbd.priv[minor].dev;
 		const char *name = bbd_dev_name[minor];
-		struct device *dev;
-
-		/* Init buf, waitqueue, mutex, etc. */
-		bbd.priv[minor].name = bbd_dev_name[minor];
-		bbd.priv[minor].read_buf.buf = bbd.priv[minor]._read_buf;
-
-		init_waitqueue_head(&bbd.priv[minor].poll_wait);
-		mutex_init(&bbd.priv[minor].lock);
+		struct device *cdev_dev;
 
 		/* Don't register /dev/bbd_shmd */
 		if (minor == BBD_MINOR_SHMD)
 			continue;
-		/* Reserve char device number (a.k.a, major, minor)
-		 * for this BBD device */
-		//ret = register_chrdev_region(devno, 1, name);
-		ret = alloc_chrdev_region(&devno, 0, 1, name);
-		if (ret) {
-			pr_err("BBD:%s() failed to alloc_chrdev_region() "
-					"\"%s\", ret=%d", __func__, name, ret);
-			goto free_class;
-		}
 
 		/* Register cdev which relates above device
 		 * number with this BBD device */
 		cdev_init(cdev, &bbd_fops[minor]);
 		cdev->owner = THIS_MODULE;
 		cdev->ops = &bbd_fops[minor];
-		ret = cdev_add(cdev, devno, 1);
+		ret = cdev_add(cdev, cur_dev, 1);
 		if (ret) {
-			pr_err("BBD:%s()) failed to cdev_add() \"%s\", ret=%d",
-						__func__, name, ret);
-			unregister_chrdev_region(devno, 1);
-			goto free_class;
+			pr_err("BBD:%s() failed to cdev_add() \"%s\", ret=%d",
+			       __func__, name, ret);
+			goto free_devices;
 		}
 
 		/* Let it show in FS */
-		dev = device_create(bbd.class, NULL, devno, NULL, "%s", name);
-		if (IS_ERR_OR_NULL(dev)) {
-			pr_err("BBD:%s() failed to device_create() "
-				"\"%s\", ret=%d", __func__, name, ret);
-			unregister_chrdev_region(devno, 1);
+		cdev_dev = device_create(bbd.class, NULL, cur_dev, NULL, "%s", name);
+		if (IS_ERR(cdev_dev)) {
+			ret = PTR_ERR(cdev_dev);
+			pr_err("BBD:%s() failed to device_create() \"%s\", ret=%d",
+			       __func__, name, ret);
 			cdev_del(&bbd.priv[minor].dev);
-			goto free_class;
+			goto free_devices;
 		}
-
-		/* Done. Put success log and init BBD specific fields */
-		/*pr_info("BBD:%s(%d,%d) registered /dev/%s\n",
-			      __func__, BBD_DEVICE_MAJOR, minor, name);*/
-
 	}
 
 	/* Register sysfs entry */
 	bbd.kobj = kobject_create_and_add("bbd", NULL);
-	BUG_ON(!bbd.kobj);
+	if (!bbd.kobj) {
+		ret = -ENOMEM;
+		goto free_devices;
+	}
 	ret = sysfs_create_group(bbd.kobj, &bbd_group);
 	if (ret < 0) {
 		pr_err("%s failed to sysfs_create_group \"bbd\", ret = %d",
-							__func__, ret);
+		       __func__, ret);
 		goto free_kobj;
 	}
 
-
 	/* Register PM */
 	ret = register_pm_notifier(&bbd_notifier_block);
-	BUG_ON(ret);
+	if (ret)
+		goto free_sysfs;
 
 #ifdef CONFIG_SENSORS_SSP
 	/* Now, we can initialize SSP */
-	BUG_ON(device_register(&dummy_spi.dev));
+	ret = device_register(&dummy_spi.dev);
+	if (ret) {
+		put_device(&dummy_spi.dev);
+		unregister_pm_notifier(&bbd_notifier_block);
+		goto free_sysfs;
+	}
 	{
 		struct spi_device *spi = to_spi_device(dev);
 		void *org_priv, *new_priv;
@@ -908,32 +949,36 @@ int bbd_init(struct device *dev, bool legacy_patch)
 		new_priv = spi_get_drvdata(spi);
 		spi_set_drvdata(spi, org_priv);
 		spi_set_drvdata(&dummy_spi, new_priv);
-
 	}
 #endif
 	ts1 = ktime_to_timespec(ktime_get_boottime());
 	elapsed = (ts1.tv_sec * 1000000000ULL + ts1.tv_nsec) - start;
 	pr_info("BBD:%s %lu nsec elapsed\n", __func__, elapsed);
 
-		return 0;
+	return 0;
 
+free_sysfs:
+	sysfs_remove_group(bbd.kobj, &bbd_group);
 free_kobj:
 	kobject_put(bbd.kobj);
-free_class:
+free_devices:
 	while (--minor > BBD_MINOR_SHMD) {
-		//dev_t devno = MKDEV(BBD_DEVICE_MAJOR, minor);
+		dev_t cur_dev = MKDEV(MAJOR(devno), MINOR(devno) + minor);
 		struct cdev *cdev = &bbd.priv[minor].dev;
 
-		device_destroy(bbd.class, devno);
+		device_destroy(bbd.class, cur_dev);
 		cdev_del(cdev);
-		unregister_chrdev_region(devno, 1);
 	}
+	unregister_chrdev_region(devno, BBD_DEVICE_INDEX);
+free_class:
 	class_destroy(bbd.class);
-exit:
+free_mutexes:
+	for (minor = 0; minor < BBD_DEVICE_INDEX; minor++)
+		mutex_destroy(&bbd.priv[minor].lock);
 	return ret;
 }
 
-static void __exit bbd_exit(void)
+void bbd_exit(void)
 {
 	int minor;
 
@@ -944,25 +989,28 @@ static void __exit bbd_exit(void)
 	pssp_driver->shutdown(&dummy_spi);
 #endif
 
+	unregister_pm_notifier(&bbd_notifier_block);
+
 	/* Remove sysfs entry */
-	sysfs_remove_group(bbd.kobj, &bbd_group);
+	if (bbd.kobj) {
+		sysfs_remove_group(bbd.kobj, &bbd_group);
+		kobject_put(bbd.kobj);
+	}
 
 	/* Remove BBD char devices */
 	for (minor = BBD_MINOR_SENSOR; minor < BBD_DEVICE_INDEX; minor++) {
-		//dev_t devno = MKDEV(BBD_DEVICE_MAJOR, minor);
+		dev_t cur_dev = MKDEV(MAJOR(devno), MINOR(devno) + minor);
 		struct cdev *cdev = &bbd.priv[minor].dev;
-		//const char *name = bbd_dev_name[minor];
 
-		device_destroy(bbd.class, devno);
+		device_destroy(bbd.class, cur_dev);
 		cdev_del(cdev);
-		unregister_chrdev_region(devno, 1);
-
-		/*pr_info("%s(%d,%d) unregistered /dev/%s\n",
-			__func__, BBD_DEVICE_MAJOR, minor, name);*/
 	}
+	unregister_chrdev_region(devno, BBD_DEVICE_INDEX);
 
 	/* Remove class */
 	class_destroy(bbd.class);
+	for (minor = 0; minor < BBD_DEVICE_INDEX; minor++)
+		mutex_destroy(&bbd.priv[minor].lock);
 	/* Done. Put success log */
 	pr_info("%s --\n", __func__);
 }

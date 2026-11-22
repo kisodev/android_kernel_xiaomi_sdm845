@@ -167,7 +167,7 @@ struct bcm_spi_priv  {
 
 	/* Char device stuff */
 	struct miscdevice misc;
-	bool busy;
+	atomic_t busy;
 	struct circ_buf read_buf;
 	struct circ_buf write_buf;
 	struct mutex rlock;			/* Lock for read_buf */
@@ -180,6 +180,7 @@ struct bcm_spi_priv  {
 	int host_req;
 	int mcu_req;
 	int mcu_resp;
+	int gps_power;
 	int nstandby;
 
 	/* IRQ and its control */
@@ -230,6 +231,9 @@ static ssize_t bcm_4775_nstandby_show(struct device *dev,
 	int value = 0;
 	struct spi_device *spi = to_spi_device(dev);
 	struct bcm_spi_priv *priv = (struct bcm_spi_priv *)spi_get_drvdata(spi);
+
+	if (!priv)
+		return -ENODEV;
 
 	value = gpio_get_value(priv->nstandby);
 	return snprintf(buf, 20, "%d\n", value);
@@ -336,10 +340,8 @@ static int bcm_spi_open(struct inode *inode, struct file *filp)
 
 	//pr_info("%s++\n", __func__);
 
-	if (priv->busy)
+	if (atomic_cmpxchg(&priv->busy, 0, 1))
 		return -EBUSY;
-
-	priv->busy = true;
 
 	/* Reset circ buffer */
 	priv->read_buf.head = priv->read_buf.tail = 0;
@@ -441,9 +443,6 @@ static int bcm_spi_release(struct inode *inode, struct file *filp)
 	struct bcm_spi_priv *priv = filp->private_data;
 	unsigned long int flags;
 
-	//pr_info("%s++\n", __func__);
-	priv->busy = false;
-
 #ifdef CONFIG_TRANSFER_STAT
 	bcm_ssi_print_trans_stat(priv);
 #endif
@@ -452,12 +451,17 @@ static int bcm_spi_release(struct inode *inode, struct file *filp)
 	spin_lock_irqsave(&priv->irq_lock, flags);
 	if (atomic_xchg(&priv->irq_enabled, 0))
 		disable_irq_nosync(priv->spi->irq);
+	spin_unlock_irqrestore(&priv->irq_lock, flags);
 
+	flush_workqueue(priv->serial_wq);
+
+	spin_lock_irqsave(&priv->irq_lock, flags);
+	if (atomic_xchg(&priv->irq_enabled, 0))
+		disable_irq_nosync(priv->spi->irq);
 	spin_unlock_irqrestore(&priv->irq_lock, flags);
 
 	disable_irq_wake(priv->spi->irq);
-
-	//pr_info("%s--\n", __func__);
+	atomic_set(&priv->busy, 0);
 	return 0;
 }
 
@@ -476,21 +480,21 @@ static ssize_t bcm_spi_read(struct file *filp, char __user *buf,
 	/* Copy from circ buffer to user
 	 * We may require 2 copies from [tail..end] and [end..head]
 	 */
-	do {
+	while (size > 0 &&
+	       CIRC_CNT(circ->head, circ->tail, BCM_SPI_READ_BUF_SIZE)) {
 		size_t cnt_to_end = CIRC_CNT_TO_END(circ->head, circ->tail,
-							BCM_SPI_READ_BUF_SIZE);
+						    BCM_SPI_READ_BUF_SIZE);
 		size_t copied = min(cnt_to_end, size);
 
-		WARN_ON(copy_to_user(buf + rd_size,
-				(void *) circ->buf + circ->tail,
-				copied));
+		if (copy_to_user(buf + rd_size,
+				 (void *)circ->buf + circ->tail, copied)) {
+			mutex_unlock(&priv->rlock);
+			return rd_size ? rd_size : -EFAULT;
+		}
 		size -= copied;
 		rd_size += copied;
-		circ->tail = (circ->tail + copied) & (BCM_SPI_READ_BUF_SIZE-1);
-
-	} while (size > 0 &&
-			CIRC_CNT(circ->head, circ->tail,
-			BCM_SPI_READ_BUF_SIZE));
+		circ->tail = (circ->tail + copied) & (BCM_SPI_READ_BUF_SIZE - 1);
+	}
 	mutex_unlock(&priv->rlock);
 
 	// pr_info("[SSPBBD] %s--(%d bytes)\n", __func__, (int)rd_size);
@@ -512,30 +516,27 @@ static ssize_t bcm_spi_write(struct file *filp, const char __user *buf,
 	/* Copy from user into circ buffer
 	 * We may require 2 copies from [tail..end] and [end..head]
 	 */
-	do {
-		size_t space_to_end = CIRC_SPACE_TO_END(circ->head,
-							circ->tail,
+	while (size > 0 &&
+	       CIRC_SPACE(circ->head, circ->tail, BCM_SPI_WRITE_BUF_SIZE)) {
+		size_t space_to_end = CIRC_SPACE_TO_END(circ->head, circ->tail,
 							BCM_SPI_WRITE_BUF_SIZE);
 		size_t copied = min(space_to_end, size);
 
-
-		WARN_ON(copy_from_user((void *) circ->buf + circ->head,
-								buf +
-								wr_size,
-								copied));
+		if (copy_from_user((void *)circ->buf + circ->head,
+				   buf + wr_size, copied)) {
+			mutex_unlock(&priv->wlock);
+			return wr_size ? wr_size : -EFAULT;
+		}
 		size -= copied;
 		wr_size += copied;
-		circ->head = (circ->head + copied) & (BCM_SPI_WRITE_BUF_SIZE-1);
-	} while (size > 0 && CIRC_SPACE(circ->head, circ->tail,
-			BCM_SPI_WRITE_BUF_SIZE));
+		circ->head = (circ->head + copied) & (BCM_SPI_WRITE_BUF_SIZE - 1);
+	}
 
 	mutex_unlock(&priv->wlock);
 
-	//pr_info("[SSPBBD] %s--(%d bytes)\n", __func__, (int)wr_size);
-
 	/* kick start rxtx thread */
 	/* we don't want to queue work in suspending and shutdown */
-	if (!atomic_read(&priv->suspending)) {
+	if (wr_size && !atomic_read(&priv->suspending)) {
 		/* Disable irq */
 		unsigned long int flags;
 		spin_lock_irqsave(&priv->irq_lock, flags);
@@ -724,7 +725,7 @@ static int bcm_ssi_tx(struct bcm_spi_priv *priv, int length)
 	struct bcm_ssi_rx_frame *rx = priv->rx_buf;
 	struct bcm_spi_strm_protocol *strm = &priv->tx_strm;
 	int bits_per_word = (length >= 255) ? CONFIG_SPI_DMA_BITS_PER_WORD : 8;
-	int ret, n;
+	int ret = 0, n = 0;
 	unsigned short Mwrite, Bwritten = 0;
 	unsigned short bytes_to_write = (unsigned short)length;
 	unsigned short Nread = 0;  // for Full Duplex only
@@ -765,6 +766,7 @@ static int bcm_ssi_tx(struct bcm_spi_priv *priv, int length)
 			Nread = bcm_ssi_get_len(strm->ctrl_byte, rx->data);
 			if (Nread > MAX_SPI_FRAME_LEN - strm->ctrl_len)
 				Nread = 0;
+			Nread = min_t(unsigned short, Nread, bytes_to_write);
 
 			if (Mwrite < Nread) {
 				/* Call BBD */
@@ -899,7 +901,7 @@ static int bcm_ssi_rx(struct bcm_spi_priv *priv, size_t *length)
 }
 
 void bcm_on_packet_received(void *_priv, unsigned char *data,
-							unsigned int size)
+			    size_t size)
 {
 	struct bcm_spi_priv *priv = (struct bcm_spi_priv *)_priv;
 	struct circ_buf *rd_circ = &priv->read_buf;
@@ -998,47 +1000,43 @@ static void bcm_rxtx_work(struct work_struct *work)
 		}
 
 		/* Next, write */
+		mutex_lock(&priv->wlock);
 		avail = CIRC_CNT(wr_circ->head,
-			wr_circ->tail, BCM_SPI_WRITE_BUF_SIZE);
-
-		//pr_info("[SSPBBD] %s - wr_circ %d\n", __func__,(int)avail);
-
+				 wr_circ->tail, BCM_SPI_WRITE_BUF_SIZE);
 		if (avail) {
 			size_t written = 0;
 
-			mutex_lock(&priv->wlock);
 			if (avail > (strm->frame_len - strm->ctrl_len))
 				avail = strm->frame_len - strm->ctrl_len;
-			written = 0;
 
 			/* Copy from wr_circ the data */
-			do {
-				size_t cnt_to_end =
-					CIRC_CNT_TO_END(wr_circ->head,
-					wr_circ->tail,
-					BCM_SPI_WRITE_BUF_SIZE);
-					size_t copied = min(cnt_to_end, avail);
+			while (avail > 0) {
+				size_t cnt_to_end = CIRC_CNT_TO_END(wr_circ->head,
+							    wr_circ->tail,
+							    BCM_SPI_WRITE_BUF_SIZE);
+				size_t copied = min(cnt_to_end, avail);
 
-				memcpy(priv->tx_buf->data
-					+ strm->pckt_len + written,
-				    wr_circ->buf + wr_circ->tail,
-				    copied);
+				if (!copied)
+					break;
+
+				memcpy(priv->tx_buf->data + strm->pckt_len + written,
+				       wr_circ->buf + wr_circ->tail, copied);
 				avail -= copied;
 				written += copied;
 				wr_circ->tail = (wr_circ->tail + copied) &
-				(BCM_SPI_WRITE_BUF_SIZE-1);
-			} while (avail > 0);
-			// mutex_unlock(&priv->wlock);
+						(BCM_SPI_WRITE_BUF_SIZE - 1);
+			}
 
 			/* Transmit SSI frame */
-			ret = bcm_ssi_tx(priv, written);
+			ret = written ? bcm_ssi_tx(priv, written) : 0;
 			mutex_unlock(&priv->wlock);
 
 			if (ret)
 				break;
 
 			wake_up(&priv->poll_wait);
-
+		} else {
+			mutex_unlock(&priv->wlock);
 		}
 
 	} while (gpio_get_value(priv->host_req) || CIRC_CNT(wr_circ->head,
@@ -1181,11 +1179,13 @@ static int bcm_spi_resume(struct device *dev)
 
 	atomic_set(&priv->suspending, 0);
 
-	/* Enable irq */
-	spin_lock_irqsave(&priv->irq_lock, flags);
-	if (!atomic_xchg(&priv->irq_enabled, 1))
-		enable_irq(spi->irq);
-	spin_unlock_irqrestore(&priv->irq_lock, flags);
+	/* Enable irq only if device is open */
+	if (atomic_read(&priv->busy)) {
+		spin_lock_irqsave(&priv->irq_lock, flags);
+		if (!atomic_xchg(&priv->irq_enabled, 1))
+			enable_irq(spi->irq);
+		spin_unlock_irqrestore(&priv->irq_lock, flags);
+	}
 	return 0;
 }
 
@@ -1263,44 +1263,44 @@ static int bcm_spi_probe(struct spi_device *spi)
 	ret = gpio_direction_output(mcu_req, 0);
 	if (ret) {
 		pr_err("[SSPBBD]:set MCUREQ input mode,fail:%d", ret);
-		goto err_exit;
+		goto free_mcu_req;
 	}
 	ret = gpio_request(mcu_resp, "MCU RESP");
 	if (ret) {
 		pr_err("[SSPBBD]: failed to request MCU RESP, ret:%d", ret);
-		goto err_exit;
+		goto free_mcu_req;
 	}
 	ret = gpio_direction_input(mcu_resp);
 	if (ret) {
 		pr_err("SSPBBD MCU_RESP input mode fail:%d", ret);
-		goto err_exit;
+		goto free_mcu_resp;
 	}
 
 	ret = gpio_request(gps_power, "GPS POWER");
 	if (ret) {
 		pr_err("SSPBBD failed request GPS POWER :%d", ret);
-		goto err_exit;
+		goto free_mcu_resp;
 	}
 	ret = gpio_direction_output(gps_power, 1);
 	if (ret) {
 		pr_err("SSPBBD:set GPS POWER inputmode fail:%d", ret);
-		goto err_exit;
+		goto free_gps_power;
 	}
 	ret = gpio_request(nstandby, "GPS NSTANDBY");
 	if (ret) {
 		pr_err("SSPBBD request GPS NSTANDBY fail %d", ret);
-		goto err_exit;
+		goto free_gps_power;
 	}
 	ret = gpio_direction_output(nstandby, 0);
 	if (ret) {
 		pr_err("SSPBBD set GPS NSTANDBY as out mode fail %d", ret);
-		goto err_exit;
+		goto free_nstandby;
 	}
 
 	/* Alloc everything */
 	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
-		goto err_exit;
+		goto free_nstandby;
 
 	memset(priv, 0, sizeof(*priv));
 
@@ -1365,7 +1365,7 @@ static int bcm_spi_probe(struct spi_device *spi)
 	mutex_init(&priv->wlock);
 	// spin_lock_init( &priv->lock );
 
-	priv->busy = false;
+	atomic_set(&priv->busy, 0);
 
 	/* Init - work */
 	INIT_WORK(&priv->rxtx_work, bcm_rxtx_work);
@@ -1377,22 +1377,32 @@ static int bcm_spi_probe(struct spi_device *spi)
 	atomic_set(&priv->suspending, 0);
 
 	/* Init - gpios */
-	priv->host_req = host_req;
-	priv->mcu_req  = mcu_req;
-	priv->mcu_resp = mcu_resp;
-	priv->nstandby = nstandby;
+	priv->host_req  = host_req;
+	priv->mcu_req   = mcu_req;
+	priv->mcu_resp  = mcu_resp;
+	priv->gps_power = gps_power;
+	priv->nstandby  = nstandby;
 
 	/* Init - etc */
 	//wakeup_source_init(&priv->bcm_wake_lock, "bcm_spi_wake_lock");
 
 	g_bcm_gps = priv;
 	/* Init BBD & SSP */
-	bbd_init(&spi->dev, legacy_patch);
+	ret = bbd_init(&spi->dev, legacy_patch);
+	if (ret) {
+		pr_err("[SSPBBD]: bbd_init failed, ret=%d\n", ret);
+		goto free_misc;
+	}
 	if (device_create_file(&priv->spi->dev, &dev_attr_nstandby))
 		pr_err("Unable to create sysfs 4775 nstandby entry");
 
 	return 0;
 
+free_misc:
+	g_bcm_gps = NULL;
+	mutex_destroy(&priv->rlock);
+	mutex_destroy(&priv->wlock);
+	misc_deregister(&priv->misc);
 free_irq:
 	if (spi->irq)
 		free_irq(spi->irq, priv);
@@ -1400,9 +1410,17 @@ free_wq:
 	if (priv->serial_wq)
 		destroy_workqueue(priv->serial_wq);
 free_mem:
-		kfree(priv->tx_buf);
-		kfree(priv->rx_buf);
-		kfree(priv);
+	kfree(priv->tx_buf);
+	kfree(priv->rx_buf);
+	kfree(priv);
+free_nstandby:
+	gpio_free(nstandby);
+free_gps_power:
+	gpio_free(gps_power);
+free_mcu_resp:
+	gpio_free(mcu_resp);
+free_mcu_req:
+	gpio_free(mcu_req);
 err_exit:
 	return -ENODEV;
 }
@@ -1414,7 +1432,8 @@ static int bcm_spi_remove(struct spi_device *spi)
 		spi_get_drvdata(spi);
 	unsigned long int flags;
 
-	//pr_notice("[SSPBBD]:  %s : called\n", __func__);
+	if (!priv)
+		return 0;
 
 	atomic_set(&priv->suspending, 1);
 
@@ -1422,7 +1441,6 @@ static int bcm_spi_remove(struct spi_device *spi)
 	spin_lock_irqsave(&priv->irq_lock, flags);
 	if (atomic_xchg(&priv->irq_enabled, 0))
 		disable_irq_nosync(spi->irq);
-
 	spin_unlock_irqrestore(&priv->irq_lock, flags);
 
 	/* Flush work */
@@ -1434,9 +1452,16 @@ static int bcm_spi_remove(struct spi_device *spi)
 	}
 
 	/* Free everything */
-	//wakeup_source_trash(&priv->bcm_wake_lock);
 	free_irq(spi->irq, priv);
 	device_remove_file(&priv->spi->dev, &dev_attr_nstandby);
+	bbd_exit();
+	misc_deregister(&priv->misc);
+	gpio_free(priv->nstandby);
+	gpio_free(priv->gps_power);
+	gpio_free(priv->mcu_resp);
+	gpio_free(priv->mcu_req);
+	mutex_destroy(&priv->rlock);
+	mutex_destroy(&priv->wlock);
 	kfree(priv->tx_buf);
 	kfree(priv->rx_buf);
 	kfree(priv);

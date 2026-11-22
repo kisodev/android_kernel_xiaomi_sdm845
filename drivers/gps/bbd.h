@@ -94,6 +94,9 @@ extern ssize_t	bbd_pull_packet(unsigned char *buf, size_t size,
 				unsigned int timeout_ms);
 extern int	bbd_mcu_reset(void);
 extern int	bbd_init(struct device *dev, bool legacy_patch);
+extern void	bbd_exit(void);
+extern ssize_t	bbd_sensor_write(const char *buf, size_t size);
+extern void	bcm_on_packet_received(void *_priv, unsigned char *data, size_t size);
 extern void bbd_parse_asic_data(unsigned char *pucData,
 					unsigned short usLen,
 					void (*to_gpsd)(unsigned char *packet,
