@@ -998,6 +998,14 @@ void sde_connector_destroy(struct drm_connector *connector)
 	if (c_conn->blob_ext_hdr)
 		drm_property_blob_put(c_conn->blob_ext_hdr);
 
+#if defined(CONFIG_MACH_XIAOMI_SDM845)
+	if (primary_c_conn == c_conn)
+		primary_c_conn = NULL;
+	if (c_conn->esd_err_irq > 0) {
+		free_irq(c_conn->esd_err_irq, c_conn);
+		c_conn->esd_err_irq = 0;
+	}
+#endif
 	if (c_conn->bl_device)
 		backlight_device_unregister(c_conn->bl_device);
 	drm_connector_unregister(connector);
@@ -2341,14 +2349,17 @@ static irqreturn_t esd_err_irq_handle(int irq, void *data)
 	}
 
 	SDE_ERROR("esd check irq report PANEL_DEAD conn_id: %d enc_id: %d, panel_status[%d]\n",
-		c_conn->base.base.id, c_conn->encoder->base.id, panel_on);
+		c_conn->base.base.id,
+		c_conn->encoder ? (int)c_conn->encoder->base.id : -1,
+		panel_on);
 
 	c_conn->panel_dead = true;
 	event.type = DRM_EVENT_PANEL_DEAD;
 	event.length = sizeof(bool);
 	msm_mode_object_event_notify(&c_conn->base.base,
 		c_conn->base.dev, &event, (u8 *)&c_conn->panel_dead);
-	sde_encoder_display_failure_notification(c_conn->encoder, false);
+	if (c_conn->encoder)
+		sde_encoder_display_failure_notification(c_conn->encoder, false);
 
 	return IRQ_HANDLED;
 }
@@ -2390,7 +2401,9 @@ void report_esd_panel_dead(void)
 	}
 
 	pr_err("esd check tddi report PANEL_DEAD conn_id: %d enc_id: %d, panel_status[%d]\n",
-		c_conn->base.base.id, c_conn->encoder->base.id, panel_on);
+		c_conn->base.base.id,
+		c_conn->encoder ? (int)c_conn->encoder->base.id : -1,
+		panel_on);
 
 	if (panel_on) {
 		c_conn->panel_dead = true;
@@ -2614,8 +2627,9 @@ static int _sde_connector_install_properties(struct drm_device *dev,
 							"esd_err_irq", c_conn);
 			if (rc < 0) {
 				pr_err("%s: request irq %d failed\n", __func__, dsi_display->panel->esd_config.esd_err_irq);
-					dsi_display->panel->esd_config.esd_err_irq = 0;
+				dsi_display->panel->esd_config.esd_err_irq = 0;
 			} else {
+				c_conn->esd_err_irq = dsi_display->panel->esd_config.esd_err_irq;
 				pr_info("%s: Request esd irq succeed!\n", __func__);
 			}
 		}
@@ -2866,6 +2880,12 @@ struct drm_connector *sde_connector_init(struct drm_device *dev,
 	return &c_conn->base;
 
 error_destroy_property:
+#if defined(CONFIG_MACH_XIAOMI_SDM845)
+	if (c_conn->esd_err_irq > 0) {
+		free_irq(c_conn->esd_err_irq, c_conn);
+		c_conn->esd_err_irq = 0;
+	}
+#endif
 	if (c_conn->blob_caps)
 		drm_property_blob_put(c_conn->blob_caps);
 	if (c_conn->blob_hdr)
