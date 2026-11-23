@@ -41,7 +41,7 @@ int gf_parse_dts(struct gf_dev *gf_dev)
 	gf_dev->reset_gpio = of_get_named_gpio(gf_dev->spi->dev.of_node, "goodix,gpio-reset", 0);
 	if (!gpio_is_valid(gf_dev->reset_gpio)) {
 		pr_info("RESET GPIO is invalid.\n");
-		return -EPERM;
+		goto err_pwr;
 	}
 
 	/*get irq resourece*/
@@ -49,7 +49,7 @@ int gf_parse_dts(struct gf_dev *gf_dev)
 	pr_info("gf::irq_gpio:%d\n", gf_dev->irq_gpio);
 	if (!gpio_is_valid(gf_dev->irq_gpio)) {
 		pr_info("IRQ GPIO is invalid.\n");
-		return -EPERM;
+		goto err_pwr;
 	}
 
 #ifdef GF_PW_CTL
@@ -58,22 +58,24 @@ int gf_parse_dts(struct gf_dev *gf_dev)
 	pr_info("goodix output pwr_gpio 1.\n");
 #endif
 	return 0;
+
+err_pwr:
+#ifdef GF_PW_CTL
+	if (gpio_is_valid(gf_dev->pwr_gpio)) {
+		gpio_free(gf_dev->pwr_gpio);
+		gf_dev->pwr_gpio = -EINVAL;
+	}
+#endif
+	return -EPERM;
 }
 
 void gf_cleanup(struct gf_dev *gf_dev)
 {
 	pr_info("[info] %s\n", __func__);
-	if (gpio_is_valid(gf_dev->irq_gpio)) {
-		gpio_free(gf_dev->irq_gpio);
-		pr_info("remove irq_gpio success\n");
-	}
-	if (gpio_is_valid(gf_dev->reset_gpio)) {
-		gpio_free(gf_dev->reset_gpio);
-		pr_info("remove reset_gpio success\n");
-	}
 #ifdef GF_PW_CTL
 	if (gpio_is_valid(gf_dev->pwr_gpio)) {
 		gpio_free(gf_dev->pwr_gpio);
+		gf_dev->pwr_gpio = -EINVAL;
 		pr_info("remove pwr_gpio success\n");
 	}
 #endif
@@ -98,7 +100,7 @@ int gf_power_off(struct gf_dev *gf_dev)
 	int rc = 0;
 #ifdef GF_PW_CTL
 	if (gpio_is_valid(gf_dev->pwr_gpio)) {
-		gpio_set_value(gf_dev->pwr_gpio, 1);
+		gpio_set_value(gf_dev->pwr_gpio, 0);
 	}
 #endif
 	pr_info("---- power off ----\n");

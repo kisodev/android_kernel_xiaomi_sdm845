@@ -98,6 +98,10 @@ struct gf_key_map maps[] = {
 
 static void gf_enable_irq(struct gf_dev *gf_dev)
 {
+	if (!gf_dev->users) {
+		pr_warn("IRQ has not been requested.\n");
+		return;
+	}
 	if (gf_dev->irq_enabled) {
 		pr_warn("IRQ has been enabled.\n");
 	} else {
@@ -108,6 +112,10 @@ static void gf_enable_irq(struct gf_dev *gf_dev)
 
 static void gf_disable_irq(struct gf_dev *gf_dev)
 {
+	if (!gf_dev->users) {
+		pr_warn("IRQ has not been requested.\n");
+		return;
+	}
 	if (gf_dev->irq_enabled) {
 		gf_dev->irq_enabled = 0;
 		disable_irq(gf_dev->irq);
@@ -307,7 +315,7 @@ static void nav_event_input(struct gf_dev *gf_dev, gf_nav_event_t nav_event)
 
 	default:
 		pr_warn("%s unknown nav event: %d\n", __func__, nav_event);
-		break;
+		return;
 	}
 
 	if ((nav_event != GF_NAV_FINGER_DOWN) && (nav_event != GF_NAV_FINGER_UP)) {
@@ -330,8 +338,7 @@ static void gf_kernel_key_input(struct gf_dev *gf_dev, struct gf_key *gf_key)
 	} else if (GF_KEY_CAMERA == gf_key->key) {
 		key_input = GF_KEY_INPUT_CAMERA;
 	} else {
-		/* add special key define */
-		key_input = gf_key->key;
+		return;
 	}
 	pr_debug("%s: received key event[%d], key=%d, value=%d\n",
 			__func__, key_input, gf_key->key, gf_key->value);
@@ -371,11 +378,13 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (retval)
 		return -EFAULT;
 
+	mutex_lock(&device_list_lock);
 	if (gf_dev->device_available == 0) {
 		if ((cmd == GF_IOC_ENABLE_POWER) || (cmd == GF_IOC_DISABLE_POWER)) {
 			pr_debug("power cmd\n");
 		} else {
 			pr_debug("Sensor is power off currently.\n");
+			mutex_unlock(&device_list_lock);
 			return -ENODEV;
 		}
 	}
@@ -480,6 +489,7 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		pr_warn("unsupport cmd:0x%x\n", cmd);
 		break;
 	}
+	mutex_unlock(&device_list_lock);
 
 	return retval;
 }
@@ -536,18 +546,23 @@ static int gf_open(struct inode *inode, struct file *filp)
 		}
 	}
 
-	if (get_hw_version_platform() == HARDWARE_PLATFORM_DIPPERN) {
-		pr_info("Try to enable fp_vdd_vreg\n");
-		gf_dev->vreg = regulator_get(&gf_dev->spi->dev, "fp_vdd_vreg");
-		if (gf_dev->vreg == NULL) {
-			dev_err(&gf_dev->spi->dev, "fp_vdd_vreg regulator get failed!\n");
-			mutex_unlock(&device_list_lock);
-			return -EPERM;
-		}
+	if (status) {
+		pr_debug("No device for minor %d\n", iminor(inode));
+		mutex_unlock(&device_list_lock);
+		return status;
+	}
 
-		if (regulator_is_enabled(gf_dev->vreg)) {
-			pr_info("fp_vdd_vreg is already enabled!\n");
-		} else {
+	if (gf_dev->users == 0) {
+		if (get_hw_version_platform() == HARDWARE_PLATFORM_DIPPERN) {
+			pr_info("Try to enable fp_vdd_vreg\n");
+			gf_dev->vreg = regulator_get(&gf_dev->spi->dev, "fp_vdd_vreg");
+			if (IS_ERR(gf_dev->vreg)) {
+				dev_err(&gf_dev->spi->dev, "fp_vdd_vreg regulator get failed!\n");
+				gf_dev->vreg = NULL;
+				mutex_unlock(&device_list_lock);
+				return -EPERM;
+			}
+
 			rc = regulator_enable(gf_dev->vreg);
 			if (rc) {
 				dev_err(&gf_dev->spi->dev, "error enabling fp_vdd_vreg!\n");
@@ -556,54 +571,58 @@ static int gf_open(struct inode *inode, struct file *filp)
 				mutex_unlock(&device_list_lock);
 				return -EPERM;
 			}
+			pr_info("fp_vdd_vreg is enabled!\n");
 		}
-		pr_info("fp_vdd_vreg is enabled!\n");
+
+		rc = gpio_request(gf_dev->reset_gpio, "goodix_reset");
+		if (rc) {
+			dev_err(&gf_dev->spi->dev, "Failed to request RESET GPIO. rc = %d\n", rc);
+			goto err_vreg;
+		}
+		gpio_direction_output(gf_dev->reset_gpio, 1);
+
+		rc = gpio_request(gf_dev->irq_gpio, "goodix_irq");
+		if (rc) {
+			dev_err(&gf_dev->spi->dev, "Failed to request IRQ GPIO. rc = %d\n", rc);
+			goto err_reset_gpio;
+		}
+		gpio_direction_input(gf_dev->irq_gpio);
+
+		rc = request_threaded_irq(gf_dev->irq, NULL, gf_irq,
+					  IRQF_TRIGGER_RISING | IRQF_ONESHOT,
+					  "gf", gf_dev);
+		if (rc) {
+			dev_err(&gf_dev->spi->dev, "Failed to request IRQ %d. rc = %d\n",
+				gf_dev->irq, rc);
+			goto err_irq_gpio;
+		}
+		enable_irq_wake(gf_dev->irq);
+		gf_dev->irq_enabled = 1;
 	}
 
-	if (status == 0) {
-		if (status == 0) {
-			rc = gpio_request(gf_dev->reset_gpio, "goodix_reset");
-			if (rc) {
-				dev_err(&gf_dev->spi->dev, "Failed to request RESET GPIO. rc = %d\n", rc);
-				mutex_unlock(&device_list_lock);
-				return -EPERM;
-			}
-
-			gpio_direction_output(gf_dev->reset_gpio, 1);
-
-			rc = gpio_request(gf_dev->irq_gpio, "goodix_irq");
-			if (rc) {
-				dev_err(&gf_dev->spi->dev, "Failed to request IRQ GPIO. rc = %d\n", rc);
-				mutex_unlock(&device_list_lock);
-				return -EPERM;
-			}
-			gpio_direction_input(gf_dev->irq_gpio);
-
-			rc = request_threaded_irq(gf_dev->irq, NULL, gf_irq,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-					"gf", gf_dev);
-
-			if (!rc) {
-				enable_irq_wake(gf_dev->irq);
-				gf_dev->irq_enabled = 1;
-				gf_disable_irq(gf_dev);
-			}
-
-			gf_dev->users++;
-			filp->private_data = gf_dev;
-			nonseekable_open(inode, filp);
-			pr_debug("Succeed to open device. irq = %d\n",
-					gf_dev->irq);
-			if (gf_dev->users == 1)
-				gf_enable_irq(gf_dev);
-			gf_hw_reset(gf_dev, 3);
-			gf_dev->device_available = 1;
-		}
-	} else {
-		pr_debug("No device for minor %d\n", iminor(inode));
+	gf_dev->users++;
+	filp->private_data = gf_dev;
+	nonseekable_open(inode, filp);
+	pr_debug("Succeed to open device. irq = %d\n", gf_dev->irq);
+	if (gf_dev->users == 1) {
+		gf_hw_reset(gf_dev, 3);
+		gf_dev->device_available = 1;
 	}
 	mutex_unlock(&device_list_lock);
-	return status;
+	return 0;
+
+err_irq_gpio:
+	gpio_free(gf_dev->irq_gpio);
+err_reset_gpio:
+	gpio_free(gf_dev->reset_gpio);
+err_vreg:
+	if (gf_dev->vreg) {
+		regulator_disable(gf_dev->vreg);
+		regulator_put(gf_dev->vreg);
+		gf_dev->vreg = NULL;
+	}
+	mutex_unlock(&device_list_lock);
+	return -EPERM;
 }
 
 #ifdef GF_FASYNC
@@ -621,40 +640,40 @@ static int gf_fasync(int fd, struct file *filp, int mode)
 static int gf_release(struct inode *inode, struct file *filp)
 {
 	struct gf_dev *gf_dev;
-	int status = 0;
 
 	mutex_lock(&device_list_lock);
 	gf_dev = filp->private_data;
 	filp->private_data = NULL;
-
-	/*
-	 *Disable fp_vdd_vreg regulator
-	 */
-	if (get_hw_version_platform() == HARDWARE_PLATFORM_DIPPERN) {
-		pr_info("disable fp_vdd_vreg!\n");
-		if (regulator_is_enabled(gf_dev->vreg)) {
-			regulator_disable(gf_dev->vreg);
-			regulator_put(gf_dev->vreg);
-			gf_dev->vreg = NULL;
-		}
+	if (!gf_dev) {
+		mutex_unlock(&device_list_lock);
+		return 0;
 	}
 
-
 	/*last close?? */
-	gf_dev->users--;
+	if (gf_dev->users > 0)
+		gf_dev->users--;
 	if (!gf_dev->users) {
-
 		pr_debug("disble_irq. irq = %d\n", gf_dev->irq);
-		gf_disable_irq(gf_dev);
+		if (gf_dev->irq_enabled) {
+			disable_irq(gf_dev->irq);
+			gf_dev->irq_enabled = 0;
+		}
+		disable_irq_wake(gf_dev->irq);
 		/*power off the sensor*/
 		gf_dev->device_available = 0;
 		free_irq(gf_dev->irq, gf_dev);
 		gpio_free(gf_dev->irq_gpio);
 		gpio_free(gf_dev->reset_gpio);
 		gf_power_off(gf_dev);
+		if (gf_dev->vreg) {
+			pr_info("disable fp_vdd_vreg!\n");
+			regulator_disable(gf_dev->vreg);
+			regulator_put(gf_dev->vreg);
+			gf_dev->vreg = NULL;
+		}
 	}
 	mutex_unlock(&device_list_lock);
-	return status;
+	return 0;
 }
 
 static const struct file_operations gf_fops = {
@@ -739,13 +758,15 @@ static ssize_t proximity_state_set(struct device *dev,
 	if (rc)
 		return -EINVAL;
 
+	mutex_lock(&device_list_lock);
 	gf_dev->proximity_state = !!val;
-
-	if (gf_dev->proximity_state) {
-		gf_disable_irq(gf_dev);
-	} else {
-		gf_enable_irq(gf_dev);
+	if (gf_dev->users) {
+		if (gf_dev->proximity_state)
+			gf_disable_irq(gf_dev);
+		else
+			gf_enable_irq(gf_dev);
 	}
+	mutex_unlock(&device_list_lock);
 
 	return count;
 }
@@ -797,12 +818,12 @@ static int gf_probe(struct platform_device *pdev)
 	mutex_lock(&device_list_lock);
 	minor = find_first_zero_bit(minors, N_SPI_MINORS);
 	if (minor < N_SPI_MINORS) {
-		struct device *dev;
+		struct device *cdev;
 
 		gf_dev->devt = MKDEV(SPIDEV_MAJOR, minor);
-		dev = device_create(gf_class, &gf_dev->spi->dev, gf_dev->devt,
-				gf_dev, GF_DEV_NAME);
-		status = IS_ERR(dev) ? PTR_ERR(dev) : 0;
+		cdev = device_create(gf_class, &gf_dev->spi->dev, gf_dev->devt,
+				     gf_dev, GF_DEV_NAME);
+		status = IS_ERR(cdev) ? PTR_ERR(cdev) : 0;
 	} else {
 		dev_dbg(&gf_dev->spi->dev, "no minor number available!\n");
 		status = -ENODEV;
@@ -815,26 +836,26 @@ static int gf_probe(struct platform_device *pdev)
 		list_add(&gf_dev->device_entry, &device_list);
 	} else {
 		gf_dev->devt = 0;
+		mutex_unlock(&device_list_lock);
+		goto error_hw;
 	}
 	mutex_unlock(&device_list_lock);
 
-	if (status == 0) {
-		/*input device subsystem */
-		gf_dev->input = input_allocate_device();
-		if (gf_dev->input == NULL) {
-			pr_err("%s, failed to allocate input device\n", __func__);
-			status = -ENOMEM;
-			goto error_dev;
-		}
-		for (i = 0; i < ARRAY_SIZE(maps); i++)
-			input_set_capability(gf_dev->input, maps[i].type, maps[i].code);
+	/*input device subsystem */
+	gf_dev->input = input_allocate_device();
+	if (gf_dev->input == NULL) {
+		pr_err("%s, failed to allocate input device\n", __func__);
+		status = -ENOMEM;
+		goto error_dev;
+	}
+	for (i = 0; i < ARRAY_SIZE(maps); i++)
+		input_set_capability(gf_dev->input, maps[i].type, maps[i].code);
 
-		gf_dev->input->name = GF_INPUT_NAME;
-		status = input_register_device(gf_dev->input);
-		if (status) {
-			pr_err("failed to register input device\n");
-			goto error_input;
-		}
+	gf_dev->input->name = GF_INPUT_NAME;
+	status = input_register_device(gf_dev->input);
+	if (status) {
+		pr_err("failed to register input device\n");
+		goto error_input;
 	}
 #ifdef AP_CONTROL_CLK
 	pr_debug("Get the clk resource.\n");
@@ -858,7 +879,7 @@ static int gf_probe(struct platform_device *pdev)
 	status = sysfs_create_group(&dev->kobj, &attribute_group);
 	if (status) {
 		dev_err(dev, "could not create sysfs\n");
-		goto error_hw;
+		goto error_drm;
 	}
 
 	fp_wakelock = wakeup_source_register(&gf_dev->spi->dev, "fp_wakelock");
@@ -866,15 +887,20 @@ static int gf_probe(struct platform_device *pdev)
 
 	return status;
 
+error_drm:
+	drm_unregister_client(&gf_dev->notifier);
 #ifdef AP_CONTROL_CLK
 gfspi_probe_clk_enable_failed:
 	gfspi_ioctl_clk_uninit(gf_dev);
 gfspi_probe_clk_init_failed:
 #endif
 	input_unregister_device(gf_dev->input);
+	gf_dev->input = NULL;
 error_input:
-	if (gf_dev->input != NULL)
+	if (gf_dev->input != NULL) {
 		input_free_device(gf_dev->input);
+		gf_dev->input = NULL;
+	}
 error_dev:
 	if (gf_dev->devt != 0) {
 		pr_debug("Err: status = %d\n", status);
@@ -899,25 +925,35 @@ static int gf_remove(struct platform_device *pdev)
 {
 	struct gf_dev *gf_dev = &gf;
 
-	wakeup_source_unregister(fp_wakelock);
-	/* make sure ops on existing fds can abort cleanly */
-	if (gf_dev->irq)
-		free_irq(gf_dev->irq, gf_dev);
+	sysfs_remove_group(&pdev->dev.kobj, &attribute_group);
+	drm_unregister_client(&gf_dev->notifier);
 
-	if (gf_dev->input != NULL)
-		input_unregister_device(gf_dev->input);
-	input_free_device(gf_dev->input);
-
-	/* prevent new opens */
 	mutex_lock(&device_list_lock);
+	if (gf_dev->users > 0) {
+		disable_irq_wake(gf_dev->irq);
+		free_irq(gf_dev->irq, gf_dev);
+		gpio_free(gf_dev->irq_gpio);
+		gpio_free(gf_dev->reset_gpio);
+		gf_power_off(gf_dev);
+		if (gf_dev->vreg) {
+			regulator_disable(gf_dev->vreg);
+			regulator_put(gf_dev->vreg);
+			gf_dev->vreg = NULL;
+		}
+		gf_dev->users = 0;
+	}
+	wakeup_source_unregister(fp_wakelock);
+	fp_wakelock = NULL;
+
+	if (gf_dev->input != NULL) {
+		input_unregister_device(gf_dev->input);
+		gf_dev->input = NULL;
+	}
+
 	list_del(&gf_dev->device_entry);
 	device_destroy(gf_class, gf_dev->devt);
 	clear_bit(MINOR(gf_dev->devt), minors);
-	if (gf_dev->users == 0)
-		gf_cleanup(gf_dev);
-
-
-	drm_unregister_client(&gf_dev->notifier);
+	gf_cleanup(gf_dev);
 	mutex_unlock(&device_list_lock);
 
 	return 0;
@@ -973,6 +1009,7 @@ static int __init gf_init(void)
 		class_destroy(gf_class);
 		unregister_chrdev(SPIDEV_MAJOR, gf_driver.driver.name);
 		pr_warn("Failed to register SPI driver.\n");
+		return status;
 	}
 
 #ifdef GF_NETLINK_ENABLE
