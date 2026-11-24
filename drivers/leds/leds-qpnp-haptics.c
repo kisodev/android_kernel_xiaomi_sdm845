@@ -314,6 +314,7 @@ struct hap_chip {
 	struct mutex			play_lock;
 	struct mutex			param_lock;
 	struct work_struct		haptics_work;
+	struct work_struct		auto_res_err_poll_work;
 	struct hrtimer			stop_timer;
 	struct hrtimer			auto_res_err_poll_timer;
 	u16				base;
@@ -334,6 +335,7 @@ struct hap_chip {
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 	int				effect_index;
 	u32				effect_max;
+	u32				effect_arry_len;
 	u8				(*effect_arry)[HAP_WAVE_SAMP_LEN];
 #endif
 	u32				wave_rep_cnt;
@@ -361,6 +363,8 @@ struct hap_chip {
 	bool				module_en;
 	bool				lra_auto_mode;
 	bool				play_irq_en;
+	bool				play_irq_requested;
+	bool				sc_irq_requested;
 	bool				auto_res_err_recovery_hw;
 };
 
@@ -829,19 +833,30 @@ static enum hrtimer_restart hap_stop_timer(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+static void qpnp_haptics_auto_res_err_poll_work(struct work_struct *work)
+{
+	struct hap_chip *chip = container_of(work, struct hap_chip,
+					auto_res_err_poll_work);
+
+	if (!mutex_trylock(&chip->play_lock))
+		return;
+	if (chip->status_flags & AUTO_RESONANCE_ENABLED)
+		qpnp_haptics_update_lra_frequency(chip);
+	mutex_unlock(&chip->play_lock);
+}
+
 static enum hrtimer_restart hap_auto_res_err_poll_timer(struct hrtimer *timer)
 {
 	struct hap_chip *chip = container_of(timer, struct hap_chip,
 					auto_res_err_poll_timer);
 
-	if (!(chip->status_flags & AUTO_RESONANCE_ENABLED))
+	if (!(READ_ONCE(chip->status_flags) & AUTO_RESONANCE_ENABLED))
 		return HRTIMER_NORESTART;
 
-	qpnp_haptics_update_lra_frequency(chip);
-	hrtimer_forward(&chip->auto_res_err_poll_timer, ktime_get(),
-			ktime_set(0, AUTO_RES_ERR_POLL_TIME_NS));
+	schedule_work(&chip->auto_res_err_poll_work);
+	hrtimer_forward_now(timer, ktime_set(0, AUTO_RES_ERR_POLL_TIME_NS));
 
-	return HRTIMER_NORESTART;
+	return HRTIMER_RESTART;
 }
 
 static int qpnp_haptics_suspend(struct device *dev)
@@ -1208,11 +1223,11 @@ static int qpnp_haptics_auto_mode_config(struct hap_chip *chip, int time_ms)
 		/*
 		 * only change pattern for different vibration cycle.
 		 * */
-		if (chip->effect_max) {
+		if (chip->effect_max && chip->effect_arry) {
 			int i = 0;
 			if (index != chip->effect_index) {
 				if (index >= chip->effect_max) {
-						index = chip->effect_max - 1;
+					index = chip->effect_max - 1;
 				}
 				chip->effect_index = index;
 				for (i = 0; i < HAP_WAVE_SAMP_LEN; i++) {
@@ -1386,31 +1401,27 @@ static irqreturn_t qpnp_haptics_play_irq_handler(int irq, void *data)
 	struct hap_chip *chip = data;
 	int rc;
 
+	mutex_lock(&chip->play_lock);
 	if (chip->play_mode != HAP_BUFFER)
 		goto irq_handled;
 
-	if (chip->wave_samp[chip->wave_samp_idx + HAP_WAVE_SAMP_LEN] > 0) {
+	if (chip->wave_samp_idx + HAP_WAVE_SAMP_LEN < ARRAY_SIZE(chip->wave_samp) &&
+	    chip->wave_samp[chip->wave_samp_idx + HAP_WAVE_SAMP_LEN] > 0) {
 		chip->wave_samp_idx += HAP_WAVE_SAMP_LEN;
-		if (chip->wave_samp_idx >= ARRAY_SIZE(chip->wave_samp)) {
-			pr_debug("Samples over\n");
-			/* fall through to stop playing */
-		} else {
-			pr_debug("moving to next sample set %d\n",
-				chip->wave_samp_idx);
+		pr_debug("moving to next sample set %d\n",
+			chip->wave_samp_idx);
 
-			rc = qpnp_haptics_buffer_config(chip, NULL, false);
-			if (rc < 0) {
-				pr_err("Error in configuring buffer, rc=%d\n",
-					rc);
-				goto irq_handled;
-			}
-
-			/*
-			 * Moving to next set of wave sample. No need to stop
-			 * or change the play control. Just return.
-			 */
+		rc = qpnp_haptics_buffer_config(chip, NULL, false);
+		if (rc < 0) {
+			pr_err("Error in configuring buffer, rc=%d\n", rc);
 			goto irq_handled;
 		}
+
+		/*
+		 * Moving to next set of wave sample. No need to stop
+		 * or change the play control. Just return.
+		 */
+		goto irq_handled;
 	}
 
 	rc = qpnp_haptics_play_control(chip, HAP_STOP);
@@ -1421,6 +1432,7 @@ static irqreturn_t qpnp_haptics_play_irq_handler(int irq, void *data)
 	chip->wave_samp_idx = 0;
 
 irq_handled:
+	mutex_unlock(&chip->play_lock);
 	return IRQ_HANDLED;
 }
 
@@ -1591,7 +1603,6 @@ static ssize_t qpnp_haptics_show_overdrive(struct device *dev,
 	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
 
 	return snprintf(buf, PAGE_SIZE, "%u\n", chip->overdrive);
-	return 0;
 }
 #endif
 
@@ -1617,23 +1628,24 @@ static ssize_t qpnp_haptics_store_activate(struct device *dev,
 	if (val != 0 && val != 1)
 		return count;
 
-	if (val) {
-		hrtimer_cancel(&chip->stop_timer);
-		if (is_sw_lra_auto_resonance_control(chip))
-			hrtimer_cancel(&chip->auto_res_err_poll_timer);
-		cancel_work_sync(&chip->haptics_work);
+	hrtimer_cancel(&chip->stop_timer);
+	if (is_sw_lra_auto_resonance_control(chip))
+		hrtimer_cancel(&chip->auto_res_err_poll_timer);
+	cancel_work_sync(&chip->auto_res_err_poll_work);
+	cancel_work_sync(&chip->haptics_work);
 
+	if (val) {
 		atomic_set(&chip->state, 1);
 		schedule_work(&chip->haptics_work);
 	} else {
-		hrtimer_cancel(&chip->stop_timer);
-		if (is_sw_lra_auto_resonance_control(chip))
-			hrtimer_cancel(&chip->auto_res_err_poll_timer);
-		cancel_work_sync(&chip->haptics_work);
-
 		atomic_set(&chip->state, 0);
+		mutex_lock(&chip->play_lock);
 		rc = qpnp_haptics_play_control(chip, HAP_STOP);
-		rc = qpnp_haptics_mod_enable(chip, false);
+		if (rc >= 0)
+			rc = qpnp_haptics_mod_enable(chip, false);
+		if (rc >= 0 && chip->play_mode == HAP_PWM)
+			pwm_disable(chip->pwm_data.pwm_dev);
+		mutex_unlock(&chip->play_lock);
 		if (rc < 0) {
 			pr_err("Error in disabling module, rc=%d\n", rc);
 			return rc;
@@ -1687,22 +1699,25 @@ static ssize_t qpnp_haptics_store_play_mode(struct device *dev,
 	else
 		return -EINVAL;
 
-	if (temp == chip->play_mode)
+	mutex_lock(&chip->param_lock);
+	mutex_lock(&chip->play_lock);
+	if (temp == chip->play_mode) {
+		mutex_unlock(&chip->play_lock);
+		mutex_unlock(&chip->param_lock);
 		return count;
+	}
 
 	if (temp == HAP_BUFFER) {
 		rc = qpnp_haptics_parse_buffer_dt(chip);
 		if (!rc) {
 			rc = qpnp_haptics_wave_rep_config(chip,
 				HAP_WAVE_REPEAT | HAP_WAVE_SAMP_REPEAT);
-			if (rc < 0) {
+			if (rc < 0)
 				pr_err("Error in configuring wave_rep config %d\n",
 					rc);
-				return rc;
-			}
 		}
-
-		rc = qpnp_haptics_buffer_config(chip, NULL, true);
+		if (!rc)
+			rc = qpnp_haptics_buffer_config(chip, NULL, true);
 	} else if (temp == HAP_PWM) {
 		rc = qpnp_haptics_parse_pwm_dt(chip);
 		if (!rc)
@@ -1710,29 +1725,32 @@ static ssize_t qpnp_haptics_store_play_mode(struct device *dev,
 	}
 
 	if (rc < 0)
-		return rc;
+		goto unlock;
 
 	rc = qpnp_haptics_mod_enable(chip, false);
 	if (rc < 0)
-		return rc;
+		goto unlock;
 
 	old_mode = chip->play_mode;
 	chip->play_mode = temp;
 	rc = qpnp_haptics_play_mode_config(chip);
 	if (rc < 0) {
 		chip->play_mode = old_mode;
-		return rc;
+		goto unlock;
 	}
 
 	if (chip->play_mode == HAP_AUDIO) {
 		rc = qpnp_haptics_mod_enable(chip, true);
 		if (rc < 0) {
 			chip->play_mode = old_mode;
-			return rc;
+			goto unlock;
 		}
 	}
 
-	return count;
+unlock:
+	mutex_unlock(&chip->play_lock);
+	mutex_unlock(&chip->param_lock);
+	return rc < 0 ? rc : count;
 }
 
 static ssize_t qpnp_haptics_show_wf_samp(struct device *dev,
@@ -1740,17 +1758,16 @@ static ssize_t qpnp_haptics_show_wf_samp(struct device *dev,
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-	char str[HAP_STR_SIZE + 1];
-	char *ptr = str;
 	int i, len = 0;
 
-	for (i = 0; i < ARRAY_SIZE(chip->wave_samp); i++) {
-		len = scnprintf(ptr, HAP_STR_SIZE, "%x ", chip->wave_samp[i]);
-		ptr += len;
-	}
-	ptr[len] = '\0';
+	mutex_lock(&chip->param_lock);
+	for (i = 0; i < ARRAY_SIZE(chip->wave_samp); i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%x ",
+				 chip->wave_samp[i]);
+	mutex_unlock(&chip->param_lock);
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
 
-	return snprintf(buf, PAGE_SIZE, "%s\n", str);
+	return len;
 }
 
 static ssize_t qpnp_haptics_store_wf_samp(struct device *dev,
@@ -1769,10 +1786,14 @@ static ssize_t qpnp_haptics_store_wf_samp(struct device *dev,
 		pos += bytes_read;
 	}
 
+	mutex_lock(&chip->param_lock);
+	mutex_lock(&chip->play_lock);
 	for (i = 0; i < ARRAY_SIZE(chip->wave_samp); i++)
 		chip->wave_samp[i] = samp[i];
 
 	rc = qpnp_haptics_buffer_config(chip, NULL, false);
+	mutex_unlock(&chip->play_lock);
+	mutex_unlock(&chip->param_lock);
 	if (rc < 0) {
 		pr_err("Error in configuring buffer mode %d\n", rc);
 		return rc;
@@ -1787,22 +1808,21 @@ static ssize_t qpnp_haptics_show_effect_samp(struct device *dev,
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-	char str[HAP_STR_SIZE + 1];
-	char *ptr = str;
 	int i, len = 0;
-    pr_err("%s---effect_index=%d\n", __func__, chip->effect_index);
-	if (chip->effect_index == -1){
-        pr_err("%s, chip->effect_index == -1\n", __func__);
-		return 0;
-    }
-    pr_err("%s, HAP_WAVE_SAMP_LEN=%d\n", __func__, HAP_WAVE_SAMP_LEN);
-	for (i = 0; i < HAP_WAVE_SAMP_LEN; i++) {
-		len = scnprintf(ptr, HAP_STR_SIZE, "%x ", chip->effect_arry[chip->effect_index][i]);
-		ptr += len;
-	}
-	ptr[len] = '\0';
 
-	return snprintf(buf, PAGE_SIZE, "%s\n", str);
+	mutex_lock(&chip->param_lock);
+	if (!chip->effect_arry || chip->effect_index < 0 ||
+	    chip->effect_index >= chip->effect_max) {
+		mutex_unlock(&chip->param_lock);
+		return 0;
+	}
+	for (i = 0; i < HAP_WAVE_SAMP_LEN; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%x ",
+				 chip->effect_arry[chip->effect_index][i]);
+	mutex_unlock(&chip->param_lock);
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+
+	return len;
 }
 
 static ssize_t qpnp_haptics_store_effect_samp(struct device *dev,
@@ -1810,28 +1830,31 @@ static ssize_t qpnp_haptics_store_effect_samp(struct device *dev,
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-	int bytes_read, rc;
+	int bytes_read = 0, rc;
 	unsigned int data, pos = 0, i = 0;
 	u32 wave_samp[HAP_WAVE_SAMP_LEN] = {0};
-	bytes_read = 0;
 
-    pr_err("%s---effect_index=%d\n", __func__, chip->effect_index);
-	if (chip->effect_index == -1)
+	mutex_lock(&chip->param_lock);
+	if (!chip->effect_arry || chip->effect_index < 0 ||
+	    chip->effect_index >= chip->effect_max) {
+		mutex_unlock(&chip->param_lock);
 		return 0;
+	}
 
 	while (pos < count && i < HAP_WAVE_SAMP_LEN &&
 		sscanf(buf + pos, "%x%n", &data, &bytes_read) == 1) {
-        pr_err("%s, while-loop\n", __func__);
-		/* bit 0 is not used in WF_Sx */
 		wave_samp[i] = data;
 		chip->effect_arry[chip->effect_index][i++] = data;
 		pos += bytes_read;
 	}
 
-	for (i = pos; i < HAP_WAVE_SAMP_LEN; i++)
-		chip->effect_arry[chip->effect_index][i++] = 0;
+	for (; i < HAP_WAVE_SAMP_LEN; i++)
+		chip->effect_arry[chip->effect_index][i] = 0;
 
+	mutex_lock(&chip->play_lock);
 	rc = qpnp_haptics_buffer_config(chip, wave_samp, chip->overdrive);
+	mutex_unlock(&chip->play_lock);
+	mutex_unlock(&chip->param_lock);
 	if (rc < 0) {
 		pr_err("Error in configuring buffer mode %d\n", rc);
 		return rc;
@@ -1853,9 +1876,19 @@ static ssize_t qpnp_haptics_store_effect_max(struct device *dev,
 {
 	struct led_classdev *cdev = dev_get_drvdata(dev);
 	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
+	u32 val;
 
-	if (sscanf(buf, " %u", &chip->effect_max) != 1)
-			return -EINVAL;
+	if (kstrtou32(buf, 0, &val) < 0)
+		return -EINVAL;
+
+	mutex_lock(&chip->param_lock);
+	if (val > chip->effect_arry_len) {
+		mutex_unlock(&chip->param_lock);
+		return -EINVAL;
+	}
+	chip->effect_max = val;
+	mutex_unlock(&chip->param_lock);
+
 	return count;
 }
 #endif
@@ -2128,14 +2161,15 @@ static int qpnp_haptics_config(struct hap_chip *chip)
 
 	/* setup play irq */
 	if (chip->play_irq >= 0) {
-		rc = devm_request_threaded_irq(&chip->pdev->dev, chip->play_irq,
-			NULL, qpnp_haptics_play_irq_handler, IRQF_ONESHOT,
+		rc = request_threaded_irq(chip->play_irq, NULL,
+			qpnp_haptics_play_irq_handler, IRQF_ONESHOT,
 			"haptics_play_irq", chip);
 		if (rc < 0) {
 			pr_err("Unable to request play(%d) IRQ(err:%d)\n",
 				chip->play_irq, rc);
 			return rc;
 		}
+		chip->play_irq_requested = true;
 
 		chip->play_irq_en = true;
 		/* use play_irq only for buffer mode */
@@ -2147,14 +2181,15 @@ static int qpnp_haptics_config(struct hap_chip *chip)
 
 	/* setup short circuit irq */
 	if (chip->sc_irq >= 0) {
-		rc = devm_request_threaded_irq(&chip->pdev->dev, chip->sc_irq,
-			NULL, qpnp_haptics_sc_irq_handler, IRQF_ONESHOT,
+		rc = request_threaded_irq(chip->sc_irq, NULL,
+			qpnp_haptics_sc_irq_handler, IRQF_ONESHOT,
 			"haptics_sc_irq", chip);
 		if (rc < 0) {
 			pr_err("Unable to request sc(%d) IRQ(err:%d)\n",
 				chip->sc_irq, rc);
 			return rc;
 		}
+		chip->sc_irq_requested = true;
 	}
 
 	return rc;
@@ -2180,27 +2215,30 @@ static int qpnp_haptics_parse_buffer_dt(struct hap_chip *chip)
 	chip->effect_index = -1;
 	chip->effect_max = 0;
 	rc = of_property_read_u32(node, "qcom,effect-max", &temp);
-	if (!rc) {
+	if (!rc && !chip->effect_arry) {
+		if (temp == 0 || temp > U32_MAX / HAP_WAVE_SAMP_LEN)
+			return -EINVAL;
 		chip->effect_max = temp;
 		prop = of_find_property(node, "qcom,effect-arry", &temp);
 		if (!prop) {
-				dev_info(&chip->pdev->dev, "effect arry not found");
-			} else if (temp != HAP_WAVE_SAMP_LEN * chip->effect_max) {
-				dev_err(&chip->pdev->dev, "Invalid len of effect arry \n");
+			dev_info(&chip->pdev->dev, "effect arry not found");
+			chip->effect_max = 0;
+		} else if (temp != HAP_WAVE_SAMP_LEN * chip->effect_max) {
+			dev_err(&chip->pdev->dev, "Invalid len of effect arry\n");
+			chip->effect_max = 0;
+			return -EINVAL;
+		} else {
+			chip->effect_arry = devm_kmalloc(&chip->pdev->dev,
+				HAP_WAVE_SAMP_LEN * chip->effect_max,
+				GFP_KERNEL);
+			if (!chip->effect_arry) {
 				chip->effect_max = 0;
-				return -EINVAL;
-			} else {
-				chip->effect_arry = (u8 (*)[HAP_WAVE_SAMP_LEN])kmalloc(HAP_WAVE_SAMP_LEN * chip->effect_max, GFP_KERNEL);
-				memcpy(chip->effect_arry, prop->value,
-						HAP_WAVE_SAMP_LEN *  chip->effect_max);
-				for (temp = 0; temp < chip->effect_max; temp++) {
-					pr_info("effect_arry:%u: %u,%u,%u,%u,%u,%u,%u,%u\n",
-							temp, chip->effect_arry[temp][0], chip->effect_arry[temp][1],
-							chip->effect_arry[temp][2], chip->effect_arry[temp][3],
-							chip->effect_arry[temp][4], chip->effect_arry[temp][5],
-							chip->effect_arry[temp][6], chip->effect_arry[temp][7]);
-				}
+				return -ENOMEM;
 			}
+			chip->effect_arry_len = chip->effect_max;
+			memcpy(chip->effect_arry, prop->value,
+			       HAP_WAVE_SAMP_LEN * chip->effect_max);
+		}
 	}
 #endif
 
@@ -2256,12 +2294,14 @@ static int qpnp_haptics_parse_pwm_dt(struct hap_chip *chip)
 	if (chip->pwm_data.period_us > 0 && chip->pwm_data.duty_us > 0)
 		return 0;
 
-	chip->pwm_data.pwm_dev = of_pwm_get(node, NULL);
-	if (IS_ERR(chip->pwm_data.pwm_dev)) {
-		rc = PTR_ERR(chip->pwm_data.pwm_dev);
-		pr_err("Cannot get PWM device rc=%d\n", rc);
-		chip->pwm_data.pwm_dev = NULL;
-		return rc;
+	if (!chip->pwm_data.pwm_dev) {
+		chip->pwm_data.pwm_dev = of_pwm_get(node, NULL);
+		if (IS_ERR(chip->pwm_data.pwm_dev)) {
+			rc = PTR_ERR(chip->pwm_data.pwm_dev);
+			pr_err("Cannot get PWM device rc=%d\n", rc);
+			chip->pwm_data.pwm_dev = NULL;
+			return rc;
+		}
 	}
 
 	rc = of_property_read_u32(node, "qcom,period-us", &temp);
@@ -2628,6 +2668,8 @@ static int qpnp_haptics_parse_dt(struct hap_chip *chip)
 		rc = 0;
 
 	rc = qpnp_haptics_parse_buffer_dt(chip);
+	if (rc < 0)
+		return rc;
 
 	if (chip->play_mode == HAP_PWM)
 		rc = qpnp_haptics_parse_pwm_dt(chip);
@@ -2662,6 +2704,14 @@ static int qpnp_haptics_probe(struct platform_device *pdev)
 	mutex_init(&chip->play_lock);
 	mutex_init(&chip->param_lock);
 	INIT_WORK(&chip->haptics_work, qpnp_haptics_work);
+	INIT_WORK(&chip->auto_res_err_poll_work,
+		  qpnp_haptics_auto_res_err_poll_work);
+
+	hrtimer_init(&chip->stop_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	chip->stop_timer.function = hap_stop_timer;
+	hrtimer_init(&chip->auto_res_err_poll_timer, CLOCK_MONOTONIC,
+			HRTIMER_MODE_REL);
+	chip->auto_res_err_poll_timer.function = hap_auto_res_err_poll_timer;
 
 	rc = qpnp_haptics_config(chip);
 	if (rc < 0) {
@@ -2670,18 +2720,13 @@ static int qpnp_haptics_probe(struct platform_device *pdev)
 		goto fail;
 	}
 
-	hrtimer_init(&chip->stop_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	chip->stop_timer.function = hap_stop_timer;
-	hrtimer_init(&chip->auto_res_err_poll_timer, CLOCK_MONOTONIC,
-			HRTIMER_MODE_REL);
-	chip->auto_res_err_poll_timer.function = hap_auto_res_err_poll_timer;
 	dev_set_drvdata(&pdev->dev, chip);
 
 	chip->cdev.name = "vibrator";
 	chip->cdev.brightness_get = qpnp_haptics_brightness_get;
 	chip->cdev.brightness_set = qpnp_haptics_brightness_set;
 	chip->cdev.max_brightness = 100;
-	rc = devm_led_classdev_register(&pdev->dev, &chip->cdev);
+	rc = led_classdev_register(&pdev->dev, &chip->cdev);
 	if (rc < 0) {
 		dev_err(&pdev->dev, "Error in registering led class device, rc=%d\n",
 			rc);
@@ -2708,11 +2753,17 @@ sysfs_fail:
 	for (--i; i >= 0; i--)
 		sysfs_remove_file(&chip->cdev.dev->kobj,
 				&qpnp_haptics_attrs[i].attr);
+	led_classdev_unregister(&chip->cdev);
 register_fail:
-	cancel_work_sync(&chip->haptics_work);
 	hrtimer_cancel(&chip->auto_res_err_poll_timer);
 	hrtimer_cancel(&chip->stop_timer);
+	cancel_work_sync(&chip->auto_res_err_poll_work);
+	cancel_work_sync(&chip->haptics_work);
 fail:
+	if (chip->play_irq_requested)
+		free_irq(chip->play_irq, chip);
+	if (chip->sc_irq_requested)
+		free_irq(chip->sc_irq, chip);
 	mutex_destroy(&chip->play_lock);
 	mutex_destroy(&chip->param_lock);
 	if (chip->pwm_data.pwm_dev)
@@ -2724,10 +2775,20 @@ fail:
 static int qpnp_haptics_remove(struct platform_device *pdev)
 {
 	struct hap_chip *chip = dev_get_drvdata(&pdev->dev);
+	int i;
 
-	cancel_work_sync(&chip->haptics_work);
+	for (i = 0; i < ARRAY_SIZE(qpnp_haptics_attrs); i++)
+		sysfs_remove_file(&chip->cdev.dev->kobj,
+				&qpnp_haptics_attrs[i].attr);
+	led_classdev_unregister(&chip->cdev);
+	if (chip->play_irq_requested)
+		free_irq(chip->play_irq, chip);
+	if (chip->sc_irq_requested)
+		free_irq(chip->sc_irq, chip);
 	hrtimer_cancel(&chip->auto_res_err_poll_timer);
 	hrtimer_cancel(&chip->stop_timer);
+	cancel_work_sync(&chip->auto_res_err_poll_work);
+	cancel_work_sync(&chip->haptics_work);
 	mutex_destroy(&chip->play_lock);
 	mutex_destroy(&chip->param_lock);
 	if (chip->pwm_data.pwm_dev)
@@ -2741,10 +2802,15 @@ static void qpnp_haptics_shutdown(struct platform_device *pdev)
 {
 	struct hap_chip *chip = dev_get_drvdata(&pdev->dev);
 
+	hrtimer_cancel(&chip->auto_res_err_poll_timer);
+	hrtimer_cancel(&chip->stop_timer);
+	cancel_work_sync(&chip->auto_res_err_poll_work);
 	cancel_work_sync(&chip->haptics_work);
 
 	/* disable haptics */
+	mutex_lock(&chip->play_lock);
 	qpnp_haptics_mod_enable(chip, false);
+	mutex_unlock(&chip->play_lock);
 }
 
 static const struct dev_pm_ops qpnp_haptics_pm_ops = {
