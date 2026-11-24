@@ -167,6 +167,7 @@ static int __tri_led_set(struct qpnp_led_dev *led)
 		 * if both LEDs are turned off.
 		 */
 
+		mutex_lock(&led->chip->bus_lock);
 		prev_bitmap = led->chip->bitmap;
 		if (val)
 			led->chip->bitmap |= (1 << led->id);
@@ -180,6 +181,8 @@ static int __tri_led_set(struct qpnp_led_dev *led)
 			if (rc < 0) {
 				dev_err(led->chip->dev, "Couldn't set PBS_ARG, rc=%d\n",
 					rc);
+				led->chip->bitmap = prev_bitmap;
+				mutex_unlock(&led->chip->bus_lock);
 				return rc;
 			}
 
@@ -189,6 +192,8 @@ static int __tri_led_set(struct qpnp_led_dev *led)
 			if (rc < 0) {
 				dev_err(led->chip->dev, "Couldn't set PBS_TRIG_CLR, rc=%d\n",
 					rc);
+				led->chip->bitmap = prev_bitmap;
+				mutex_unlock(&led->chip->bus_lock);
 				return rc;
 			}
 
@@ -198,9 +203,12 @@ static int __tri_led_set(struct qpnp_led_dev *led)
 			if (rc < 0) {
 				dev_err(led->chip->dev, "Couldn't set PBS_TRIG_SET, rc=%d\n",
 					rc);
+				led->chip->bitmap = prev_bitmap;
+				mutex_unlock(&led->chip->bus_lock);
 				return rc;
 			}
 		}
+		mutex_unlock(&led->chip->bus_lock);
 	}
 
 	rc = qpnp_tri_led_masked_write(led->chip, TRILED_REG_EN_CTL,
@@ -235,9 +243,6 @@ static int qpnp_tri_led_set(struct qpnp_led_dev *led)
 	} else {
 		/* Use initial period if no blinking is required */
 		period_ns = led->pwm_setting.pre_period_ns;
-
-		if (brightness == LED_OFF)
-			duty_ns = 0;
 
 		duty_ns = period_ns * brightness;
 		do_div(duty_ns, LED_FULL);
@@ -420,10 +425,11 @@ static int qpnp_tri_led_register(struct qpnp_tri_led_chip *chip)
 		led->cdev.default_trigger = led->default_trigger;
 		led->cdev.brightness = LED_OFF;
 
-		rc = devm_led_classdev_register(chip->dev, &led->cdev);
+		rc = led_classdev_register(chip->dev, &led->cdev);
 		if (rc < 0) {
 			dev_err(chip->dev, "%s led class device registering failed, rc=%d\n",
 							led->label, rc);
+			mutex_destroy(&led->lock);
 			goto err_out;
 		}
 
@@ -434,6 +440,8 @@ static int qpnp_tri_led_register(struct qpnp_tri_led_chip *chip)
 			if (rc < 0) {
 				dev_err(chip->dev, "Create breath file for %s led failed, rc=%d\n",
 						led->label, rc);
+				led_classdev_unregister(&led->cdev);
+				mutex_destroy(&led->lock);
 				goto err_out;
 			}
 		}
@@ -442,10 +450,12 @@ static int qpnp_tri_led_register(struct qpnp_tri_led_chip *chip)
 	return 0;
 
 err_out:
-	for (j = 0; j <= i; j++) {
-		if (j < i)
+	for (j = 0; j < i; j++) {
+		if (pwm_get_output_type_supported(chip->leds[j].pwm_dev)
+				& PWM_OUTPUT_MODULATED)
 			sysfs_remove_files(&chip->leds[j].cdev.dev->kobj,
 					breath_attrs);
+		led_classdev_unregister(&chip->leds[j].cdev);
 		mutex_destroy(&chip->leds[j].lock);
 	}
 	return rc;
@@ -529,12 +539,14 @@ static int qpnp_tri_led_parse_dt(struct qpnp_tri_led_chip *chip)
 		if (rc) {
 			dev_err(chip->dev, "Get led-sources failed, rc=%d\n",
 							rc);
+			of_node_put(child_node);
 			return rc;
 		}
 
 		if (id >= TRILED_NUM_MAX) {
 			dev_err(chip->dev, "only support 0~%d current source\n",
 					TRILED_NUM_MAX - 1);
+			of_node_put(child_node);
 			return -EINVAL;
 		}
 
@@ -552,6 +564,7 @@ static int qpnp_tri_led_parse_dt(struct qpnp_tri_led_chip *chip)
 			if (rc != -EPROBE_DEFER)
 				dev_err(chip->dev, "Get pwm device for %s led failed, rc=%d\n",
 							led->label, rc);
+			of_node_put(child_node);
 			return rc;
 		}
 
@@ -622,11 +635,15 @@ static int qpnp_tri_led_remove(struct platform_device *pdev)
 	int i;
 	struct qpnp_tri_led_chip *chip = dev_get_drvdata(&pdev->dev);
 
-	mutex_destroy(&chip->bus_lock);
 	for (i = 0; i < chip->num_leds; i++) {
-		sysfs_remove_files(&chip->leds[i].cdev.dev->kobj, breath_attrs);
+		if (pwm_get_output_type_supported(chip->leds[i].pwm_dev)
+				& PWM_OUTPUT_MODULATED)
+			sysfs_remove_files(&chip->leds[i].cdev.dev->kobj,
+					breath_attrs);
+		led_classdev_unregister(&chip->leds[i].cdev);
 		mutex_destroy(&chip->leds[i].lock);
 	}
+	mutex_destroy(&chip->bus_lock);
 	dev_set_drvdata(chip->dev, NULL);
 	return 0;
 }
