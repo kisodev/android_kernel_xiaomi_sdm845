@@ -110,6 +110,9 @@ struct lm3644_chip_data {
 	struct mutex lock;
 	struct timer_list ir_stop_timer;
 	struct work_struct ir_stop_work;
+	bool ir_active;
+	unsigned long ir_deadline;
+	int open_cnt;
 
 	unsigned int chip_id;
 	unsigned int last_flag1;
@@ -205,14 +208,13 @@ static int lm3644_control(struct lm3644_chip_data *chip,
 	}
 
 	if (opmode != MODES_IR) {
+		chip->ir_active = false;
+		del_timer(&chip->ir_stop_timer);
 		if (chip->pdata->use_simulative_pwm &&
 				chip->pwm != NULL) {
 			pwm_disable(chip->pwm);
 			dev_dbg(chip->dev, "Simulative PWM disabled\n");
 		}
-
-		cancel_work_sync(&chip->ir_stop_work);
-		del_timer(&chip->ir_stop_timer);
 	}
 
 	if (opmode != MODES_STANDBY)
@@ -279,9 +281,12 @@ static int lm3644_control(struct lm3644_chip_data *chip,
 				dev_err(chip->dev, "Simulative PWM enabled\n");
 		}
 
-		if (chip->pdata->ir_prot_time > 0)
-			mod_timer(&chip->ir_stop_timer,
-				  jiffies + msecs_to_jiffies(chip->pdata->ir_prot_time));
+		chip->ir_active = true;
+		if (chip->pdata->ir_prot_time > 0) {
+			chip->ir_deadline = jiffies +
+				msecs_to_jiffies(chip->pdata->ir_prot_time);
+			mod_timer(&chip->ir_stop_timer, chip->ir_deadline);
+		}
 		break;
 
 	case MODES_STANDBY:
@@ -414,7 +419,10 @@ static int lm3644_ir_release(struct inode *node, struct file *filp)
 	struct lm3644_chip_data *chip =
 		container_of(node->i_cdev, struct lm3644_chip_data, cdev);
 
-	disable_irq_nosync(chip->ito_irq);
+	mutex_lock(&chip->lock);
+	if (chip->open_cnt > 0 && --chip->open_cnt == 0 && chip->ito_irq >= 0)
+		disable_irq_nosync(chip->ito_irq);
+	mutex_unlock(&chip->lock);
 
 	return 0;
 }
@@ -424,7 +432,14 @@ static void lm3644_ir_stop_work(struct work_struct *work)
 	struct lm3644_chip_data *chip =
 		container_of(work, struct lm3644_chip_data, ir_stop_work);
 
-	lm3644_ir_brightness_set(&chip->cdev_ir, LED_OFF);
+	mutex_lock(&chip->lock);
+	if (chip->ir_active &&
+	    (chip->pdata->ir_prot_time <= 0 ||
+	     time_after_eq(jiffies, chip->ir_deadline))) {
+		chip->br_ir = LED_OFF;
+		lm3644_control(chip, chip->br_ir, MODES_STANDBY);
+	}
+	mutex_unlock(&chip->lock);
 }
 
 static void lm3644_ir_stop_timer(struct timer_list *t)
@@ -453,7 +468,10 @@ static int lm3644_ir_open(struct inode *node, struct file *filp)
 		container_of(node->i_cdev, struct lm3644_chip_data, cdev);
 
 	filp->private_data = chip;
-	enable_irq(chip->ito_irq);
+	mutex_lock(&chip->lock);
+	if (chip->open_cnt++ == 0 && chip->ito_irq >= 0)
+		enable_irq(chip->ito_irq);
+	mutex_unlock(&chip->lock);
 	return 0;
 }
 
@@ -466,15 +484,19 @@ static ssize_t lm3644_ir_write(struct file *filp, const char *buf, size_t len, l
 
 static ssize_t lm3644_ir_read(struct file *filp, char *buf, size_t len, loff_t *fseek)
 {
-	int ret = 0;
 	int data = 0;
 	struct lm3644_chip_data *chip = filp->private_data;
 
-	data = atomic_read(&chip->ito_exception);
-	if (copy_to_user(buf,&data,sizeof(data)) != 0)
-		dev_err(chip->dev, "copy to user failed!\n");
+	if (len < sizeof(data))
+		return -EINVAL;
 
-	return ret;
+	data = atomic_read(&chip->ito_exception);
+	if (copy_to_user(buf, &data, sizeof(data)) != 0) {
+		dev_err(chip->dev, "copy to user failed!\n");
+		return -EFAULT;
+	}
+
+	return sizeof(data);
 }
 
 static unsigned int lm3644_poll(struct file *filp, poll_table *wait)
@@ -492,8 +514,6 @@ static unsigned int lm3644_poll(struct file *filp, poll_table *wait)
 		mutex_lock(&chip->lock);
 		ret = lm3644_control(chip, LED_OFF, MODES_STANDBY);
 		mutex_unlock(&chip->lock);
-
-		lm3644_ir_stop_timer(&chip->ir_stop_timer);
 
 		if (gpio_is_valid(chip->pdata->hwen_gpio)) {
 			ret = gpio_direction_output(chip->pdata->hwen_gpio, 0);
@@ -533,10 +553,11 @@ static int lm3644_ir_set_data(struct lm3644_chip_data *chip, lm3644_data params)
 	uint8_t brightness;
 
 	if (SET_BRIGHTNESS_EVENT == params.event) {
-		brightness = (uint8_t)params.data;
-		if (brightness > 0x3F) {
-			dev_err(chip->dev, "brightness %d is higher then the max value 0x3F, set to 0x3F\n", brightness);
+		if (params.data > 0x3F) {
+			dev_err(chip->dev, "brightness %u is higher then the max value 0x3F, set to 0x3F\n", params.data);
 			brightness = 0x3F;
+		} else {
+			brightness = (uint8_t)params.data;
 		}
 		ret = lm3644_control(chip, brightness, MODES_IR);
 		if (ret < 0)
@@ -546,22 +567,23 @@ static int lm3644_ir_set_data(struct lm3644_chip_data *chip, lm3644_data params)
 	return ret;
 }
 
-static int lm3644_ir_get_data(struct lm3644_chip_data *chip, lm3644_data params)
+static int lm3644_ir_get_data(struct lm3644_chip_data *chip,
+			      void __user *uarg, lm3644_data *params)
 {
-	int ret = 0;
 	unsigned int data = 0;
 
-	if (GET_CHIP_ID_EVENT == params.event)
+	if (GET_CHIP_ID_EVENT == params->event)
 		data = chip->chip_id;
-	if (GET_BRIGHTNESS_EVENT == params.event)
+	if (GET_BRIGHTNESS_EVENT == params->event)
 		data = chip->pdata->brightness;
 
-	if (copy_to_user((void __user *)&params.data, &data, sizeof(data))) {
-		ret = -ENODEV;
+	params->data = data;
+	if (copy_to_user(uarg, params, sizeof(*params))) {
 		dev_err(chip->dev, "Copy data to user space failed\n");
+		return -EFAULT;
 	}
 
-	return ret;
+	return 0;
 }
 
 
@@ -583,13 +605,14 @@ static long lm3644_ir_ioctl(struct file *filp, unsigned int cmd, unsigned long a
 	if (ret)
 		return -EFAULT;
 
-	if ((_IOC_DIR(cmd) & _IOC_WRITE) || (_IOC_DIR(cmd) & (_IOC_WRITE|_IOC_READ))) {
+	if (cmd == FLOOD_IR_IOC_WRITE || cmd == FLOOD_IR_IOC_READ) {
 		if (copy_from_user(&params, (void __user *)arg, sizeof(lm3644_data))) {
 			dev_err(chip->dev, "Copy data from user space failed\n");
 			return -EFAULT;
 		}
 	}
 
+	mutex_lock(&chip->lock);
 	switch (cmd) {
 	case FLOOD_IR_IOC_POWER_UP:
 		ret = lm3644_ir_init(chip);
@@ -601,41 +624,56 @@ static long lm3644_ir_ioctl(struct file *filp, unsigned int cmd, unsigned long a
 		ret = lm3644_ir_set_data(chip, params);
 		break;
 	case FLOOD_IR_IOC_READ:
-		ret = lm3644_ir_get_data(chip, params);
+		ret = lm3644_ir_get_data(chip, (void __user *)arg, &params);
 		break;
 	case FLOOD_IR_IOC_READ_INFO:
 	{
-		lm3644_info flood_info;
-		unsigned int ret = 0;
-		unsigned int val;
+		lm3644_info flood_info = {0};
+		unsigned int val = 0;
 
-		ret += regmap_read(chip->regmap, REG_ENABLE, &val);
+		ret = regmap_read(chip->regmap, REG_ENABLE, &val);
+		if (ret < 0)
+			break;
 		flood_info.flood_enable = (val == 0x27) ? 1 : 0;
 
-		ret += regmap_read(chip->regmap, REG_LED2_FLASH_BRIGHTNESS, &val);
+		ret = regmap_read(chip->regmap, REG_LED2_FLASH_BRIGHTNESS, &val);
+		if (ret < 0)
+			break;
 		flood_info.flood_current = (val * 11725 + 10900) * 2 / 1000;
 
-		ret += regmap_read(chip->regmap, REG_FLAG1, &val);
+		ret = regmap_read(chip->regmap, REG_FLAG1, &val);
+		if (ret < 0)
+			break;
 		flood_info.flood_error = val;
-		ret += regmap_read(chip->regmap, REG_FLAG2, &val);
-		flood_info.flood_error = (flood_info.flood_error<<8) + val;
+		ret = regmap_read(chip->regmap, REG_FLAG2, &val);
+		if (ret < 0)
+			break;
+		flood_info.flood_error = (flood_info.flood_error << 8) + val;
 
-		if (copy_to_user((void __user *)arg, &flood_info, sizeof(flood_info)) != 0 || ret != 0)
+		if (copy_to_user((void __user *)arg, &flood_info, sizeof(flood_info)) != 0) {
 			dev_err(chip->dev, "copy to user failed!\n");
+			ret = -EFAULT;
+		}
 
-		dev_err(chip->dev, "flood_info:en=%d, current=%d, error=0x%x\n", flood_info.flood_enable, flood_info.flood_current, flood_info.flood_error);
+		dev_dbg(chip->dev, "flood_info:en=%d, current=%d, error=0x%x\n", flood_info.flood_enable, flood_info.flood_current, flood_info.flood_error);
 		break;
 	}
 	default:
+		ret = -ENOTTY;
 		break;
 	}
+	mutex_unlock(&chip->lock);
 
 	return ret;
 }
 
 #ifdef CONFIG_COMPAT
+#define FLOOD_IR_IOC_READ_INFO32 \
+	_IOWR(LM3644_IOC_MAGIC, LM3644_PRIVATE_NUM + 5, compat_uptr_t)
 static long lm3644_ir_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+	if (cmd == FLOOD_IR_IOC_READ_INFO32)
+		cmd = FLOOD_IR_IOC_READ_INFO;
 	return lm3644_ir_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
 }
 #endif
@@ -654,9 +692,8 @@ static ssize_t lm3644_pwm_period_store(struct device *dev,
 	if (ret < 0)
 		return ret;
 
-	chip->pdata->pwm_period_us = val;
-
 	mutex_lock(&chip->lock);
+	chip->pdata->pwm_period_us = val;
 	ret = pwm_config(chip->pwm, chip->pdata->pwm_duty_us * NSECS_PER_USEC,
 		chip->pdata->pwm_period_us * NSECS_PER_USEC);
 	if (ret < 0) {
@@ -693,9 +730,8 @@ static ssize_t lm3644_pwm_duty_store(struct device *dev,
 	if (ret < 0)
 		return ret;
 
-	chip->pdata->pwm_duty_us = val;
-
 	mutex_lock(&chip->lock);
+	chip->pdata->pwm_duty_us = val;
 	ret = pwm_config(chip->pwm, chip->pdata->pwm_duty_us * NSECS_PER_USEC,
 		chip->pdata->pwm_period_us * NSECS_PER_USEC);
 	if (ret < 0) {
@@ -751,8 +787,8 @@ static ssize_t lm3644_reg_opt_store(struct device *dev,
 	int ret = 0;
 
 	ret = sscanf(buff, "0x%x 0x%x", &addr, &val);
-	if (ret == 0)
-		dev_err(chip->dev, "lm3644_reg_opt_store, reg=0x%x,val=0x%x.\n", addr, val);
+	if (ret != 2)
+		return -EINVAL;
 
 	if (addr > 0x13) {
 		dev_err(chip->dev, "lm3644_reg_opt_store, addr invalid:0x%x\n", addr);
@@ -857,7 +893,7 @@ static struct lm3644_platform_data *lm3644_parse_dt(struct i2c_client *client)
 			"lm3644,duty-us", &pdata->pwm_duty_us);
 		if (ret < 0) {
 			dev_err(&client->dev, "Could not find PWM duty, use default value\n");
-			pdata->pwm_period_us = LM3644_DEFAULT_DUTY_US;
+			pdata->pwm_duty_us = LM3644_DEFAULT_DUTY_US;
 		}
 	}
 
@@ -924,6 +960,7 @@ static int lm3644_probe(struct i2c_client *client,
 
 	chip->dev = &client->dev;
 	chip->pdata = pdata;
+	chip->ito_irq = -EINVAL;
 
 	chip->regmap = devm_regmap_init_i2c(client, &lm3644_regmap);
 	if (IS_ERR(chip->regmap)) {
@@ -942,6 +979,7 @@ static int lm3644_probe(struct i2c_client *client,
 			dev_err(&client->dev, "Failed to get PWM device: %d\n",
 				err);
 			chip->pwm = NULL;
+			return err;
 		}
 
 		err = pwm_config(chip->pwm, pdata->pwm_duty_us * NSECS_PER_USEC,
@@ -981,7 +1019,7 @@ static int lm3644_probe(struct i2c_client *client,
 		err = gpio_direction_output(pdata->hwen_gpio, 1);
 		if (err) {
 			dev_err(&client->dev, "Unable to set hwen to output\n");
-			goto err_pinctrl_sleep;
+			goto err_free_hwen_gpio;
 		}
 		msleep(10);
 	}
@@ -997,7 +1035,7 @@ static int lm3644_probe(struct i2c_client *client,
 		err = gpio_direction_output(pdata->tx_gpio, 0);
 		if (err) {
 			dev_err(&client->dev, "Unable to set tx_gpio to output\n");
-			goto err_free_hwen_gpio;
+			goto err_free_tx_gpio;
 		}
 	}
 
@@ -1012,7 +1050,7 @@ static int lm3644_probe(struct i2c_client *client,
 		err = gpio_direction_output(pdata->torch_gpio, 0);
 		if (err) {
 			dev_err(&client->dev, "Unable to set torch_gpio to output\n");
-			goto err_free_hwen_gpio;
+			goto err_free_torch_gpio;
 		}
 	}
 
@@ -1036,10 +1074,11 @@ static int lm3644_probe(struct i2c_client *client,
 				"lm3644_ito_det", chip);
 		if (err < 0) {
 			dev_err(&client->dev, "Unable to request irq\n");
+			chip->ito_irq = -EINVAL;
 			goto err_free_ito_gpio;
 		}
+		disable_irq_nosync(chip->ito_irq);
 	}
-	disable_irq_nosync(chip->ito_irq);
 
 	mutex_init(&chip->lock);
 	i2c_set_clientdata(client, chip);
@@ -1058,9 +1097,10 @@ static int lm3644_probe(struct i2c_client *client,
 	}
 
 	chip->chr_class = class_create(THIS_MODULE, LM3644_CLASS_NAME);
-	if (chip->chr_class == NULL) {
+	if (IS_ERR(chip->chr_class)) {
 		dev_err(&client->dev, "Failed to create class.\n");
-		err = -ENODEV;
+		err = PTR_ERR(chip->chr_class);
+		chip->chr_class = NULL;
 		goto err_free_ito_irq;
 	}
 
@@ -1123,20 +1163,22 @@ err_free_torch_classdev:
 	led_classdev_unregister(&chip->cdev_torch);
 
 err_del_cdev:
-	if (&chip->cdev)
-		cdev_del(&(chip->cdev));
+	cdev_del(&(chip->cdev));
 err_destroy_device:
-	if (chip->chr_dev)
+	if (!IS_ERR_OR_NULL(chip->chr_dev))
 		device_destroy(chip->chr_class, chip->dev_num);
 err_unregister_chrdev:
 	unregister_chrdev_region(chip->dev_num, 1);
 err_destory_class:
-	if (chip->chr_class)
+	if (!IS_ERR_OR_NULL(chip->chr_class))
 		class_destroy(chip->chr_class);
 
 err_free_ito_irq:
-	if (gpio_is_valid(pdata->ito_detect_gpio))
+	if (chip->ito_irq >= 0)
 		free_irq(chip->ito_irq, chip);
+	del_timer_sync(&chip->ir_stop_timer);
+	cancel_work_sync(&chip->ir_stop_work);
+	mutex_destroy(&chip->lock);
 err_free_ito_gpio:
 	if (gpio_is_valid(pdata->ito_detect_gpio))
 		gpio_free(pdata->ito_detect_gpio);
@@ -1166,7 +1208,8 @@ err_pinctrl_sleep:
 	}
 
 err_free_pwm:
-	pwm_put(chip->pwm);
+	if (chip->pwm)
+		pwm_put(chip->pwm);
 
 	return err;
 }
@@ -1175,23 +1218,30 @@ static int lm3644_remove(struct i2c_client *client)
 {
 	struct lm3644_chip_data *chip = i2c_get_clientdata(client);
 
-	if (&chip->cdev)
-		cdev_del(&(chip->cdev));
+	cdev_del(&(chip->cdev));
 
 	if (chip->chr_dev)
 		device_destroy(chip->chr_class, chip->dev_num);
 
 	unregister_chrdev_region(chip->dev_num, 1);
 
-	if (chip->chr_dev)
+	if (chip->chr_class)
 		class_destroy(chip->chr_class);
 
-	cancel_work_sync(&chip->ir_stop_work);
-	del_timer(&chip->ir_stop_timer);
 	led_classdev_unregister(&chip->cdev_torch);
 	led_classdev_unregister(&chip->cdev_ir);
+
+	if (gpio_is_valid(chip->pdata->ito_detect_gpio)) {
+		if (chip->ito_irq >= 0)
+			free_irq(chip->ito_irq, chip);
+		gpio_free(chip->pdata->ito_detect_gpio);
+	}
+
+	del_timer_sync(&chip->ir_stop_timer);
+	cancel_work_sync(&chip->ir_stop_work);
 	regmap_write(chip->regmap, REG_ENABLE, 0);
-	pwm_put(chip->pwm);
+	if (chip->pwm)
+		pwm_put(chip->pwm);
 
 	if (gpio_is_valid(chip->pdata->hwen_gpio)) {
 		gpio_set_value(chip->pdata->hwen_gpio, 0);
@@ -1208,12 +1258,8 @@ static int lm3644_remove(struct i2c_client *client)
 		gpio_free(chip->pdata->torch_gpio);
 	}
 
-	if (gpio_is_valid(chip->pdata->ito_detect_gpio)) {
-		free_irq(chip->ito_irq, chip);
-		gpio_free(chip->pdata->ito_detect_gpio);
-	}
-
 	lm3644_pinctrl_select(chip, STATE_SUSPEND);
+	mutex_destroy(&chip->lock);
 
 	return 0;
 }
