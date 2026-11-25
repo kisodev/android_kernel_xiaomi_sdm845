@@ -66,8 +66,10 @@ static int download_mode = 0;
 static struct kobject dload_kobj;
 
 static int in_panic;
+static DEFINE_MUTEX(tcsr_lock);
 static int dload_type = SCM_DLOAD_FULLDUMP;
 static void *dload_mode_addr;
+static bool dload_kobj_init;
 static bool dload_mode_enabled;
 static void *emergency_dload_mode_addr;
 static bool scm_dload_supported;
@@ -216,29 +218,49 @@ static void enable_emergency_dload_mode(void)
 static int dload_set(const char *val, const struct kernel_param *kp)
 {
 	int ret;
+	int old_val;
 
-	int old_val = download_mode;
-
+	mutex_lock(&tcsr_lock);
+	old_val = download_mode;
 	ret = param_set_int(val, kp);
-
-	if (ret)
+	if (ret) {
+		mutex_unlock(&tcsr_lock);
 		return ret;
+	}
 
 	/* If download_mode is not zero or one, ignore. */
-	if (download_mode >> 1) {
+	if ((unsigned int)download_mode > 1) {
 		download_mode = old_val;
+		mutex_unlock(&tcsr_lock);
 		return -EINVAL;
 	}
 
 	set_dload_mode(download_mode);
+	mutex_unlock(&tcsr_lock);
 
 	return 0;
 }
 
 static void free_dload_mode_mem(void)
 {
-	iounmap(emergency_dload_mode_addr);
-	iounmap(dload_mode_addr);
+	if (dload_kobj_init) {
+		sysfs_remove_group(&dload_kobj, &reset_attr_group);
+		kobject_put(&dload_kobj);
+		dload_kobj_init = false;
+	}
+	atomic_notifier_chain_unregister(&panic_notifier_list, &panic_blk);
+	if (dload_type_addr) {
+		iounmap(dload_type_addr);
+		dload_type_addr = NULL;
+	}
+	if (emergency_dload_mode_addr) {
+		iounmap(emergency_dload_mode_addr);
+		emergency_dload_mode_addr = NULL;
+	}
+	if (dload_mode_addr) {
+		iounmap(dload_mode_addr);
+		dload_mode_addr = NULL;
+	}
 }
 
 static void *map_prop_mem(const char *propname)
@@ -252,6 +274,7 @@ static void *map_prop_mem(const char *propname)
 	}
 
 	addr = of_iomap(np, 0);
+	of_node_put(np);
 	if (!addr)
 		pr_err("Unable to map memory for DT property: %s\n", propname);
 
@@ -310,7 +333,9 @@ static void setup_dload_mode_support(void)
 	ret = sysfs_create_group(&dload_kobj, &reset_attr_group);
 	if (ret) {
 		pr_err("%s:Error in creation sysfs_create_group\n", __func__);
-		kobject_del(&dload_kobj);
+		kobject_put(&dload_kobj);
+	} else {
+		dload_kobj_init = true;
 	}
 }
 
@@ -352,7 +377,7 @@ static ssize_t show_emmc_dload(struct kobject *kobj, struct attribute *attr,
 	else
 		show_val = 0;
 
-	return snprintf(buf, sizeof(show_val), "%u\n", show_val);
+	return snprintf(buf, PAGE_SIZE, "%u\n", show_val);
 }
 
 static size_t store_emmc_dload(struct kobject *kobj, struct attribute *attr,
@@ -380,24 +405,30 @@ static size_t store_emmc_dload(struct kobject *kobj, struct attribute *attr,
 }
 
 #ifdef CONFIG_QCOM_MINIDUMP
-static DEFINE_MUTEX(tcsr_lock);
-
 static ssize_t show_dload_mode(struct kobject *kobj, struct attribute *attr,
 				char *buf)
 {
+	int type;
+
+	mutex_lock(&tcsr_lock);
+	type = dload_type;
+	mutex_unlock(&tcsr_lock);
+
 	return scnprintf(buf, PAGE_SIZE, "DLOAD dump type: %s\n",
-		(dload_type == SCM_DLOAD_BOTHDUMPS) ? "both" :
-		((dload_type == SCM_DLOAD_MINIDUMP) ? "mini" : "full"));
+		(type == SCM_DLOAD_BOTHDUMPS) ? "both" :
+		((type == SCM_DLOAD_MINIDUMP) ? "mini" : "full"));
 }
 
 static size_t store_dload_mode(struct kobject *kobj, struct attribute *attr,
 				const char *buf, size_t count)
 {
+	mutex_lock(&tcsr_lock);
 	if (sysfs_streq(buf, "full")) {
 		dload_type = SCM_DLOAD_FULLDUMP;
 	} else if (sysfs_streq(buf, "mini")) {
 		if (!msm_minidump_enabled()) {
 			pr_err("Minidump is not enabled\n");
+			mutex_unlock(&tcsr_lock);
 			return -ENODEV;
 		}
 		dload_type = SCM_DLOAD_MINIDUMP;
@@ -405,18 +436,18 @@ static size_t store_dload_mode(struct kobject *kobj, struct attribute *attr,
 		if (!msm_minidump_enabled()) {
 			pr_err("Minidump not enabled, setting fulldump only\n");
 			dload_type = SCM_DLOAD_FULLDUMP;
-			return count;
+		} else {
+			dload_type = SCM_DLOAD_BOTHDUMPS;
 		}
-		dload_type = SCM_DLOAD_BOTHDUMPS;
 	} else {
+		mutex_unlock(&tcsr_lock);
 		pr_err("Invalid Dump setup request..\n");
 		pr_err("Supported dumps:'full', 'mini', or 'both'\n");
 		return -EINVAL;
 	}
 
-	mutex_lock(&tcsr_lock);
 	/*Overwrite TCSR reg*/
-	set_dload_mode(dload_type);
+	set_dload_mode(download_mode);
 	mutex_unlock(&tcsr_lock);
 	return count;
 }
@@ -479,7 +510,7 @@ static void msm_restart_prepare(const char *cmd)
 		/* Set warm reset as true when device is in dload mode */
 		if (get_dload_mode() ||
 			((cmd != NULL && cmd[0] != '\0') &&
-			!strcmp(cmd, "edl")))
+			!strncmp(cmd, "edl", 3)))
 			need_warm_reset = true;
 	} else {
 		need_warm_reset = (get_dload_mode() ||
@@ -502,38 +533,44 @@ static void msm_restart_prepare(const char *cmd)
 		if (!strncmp(cmd, "bootloader", 10)) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_BOOTLOADER);
-			__raw_writel(0x77665500, restart_reason);
+			if (restart_reason)
+				__raw_writel(0x77665500, restart_reason);
 		} else if (!strncmp(cmd, "recovery", 8)) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_RECOVERY);
-			__raw_writel(0x77665502, restart_reason);
+			if (restart_reason)
+				__raw_writel(0x77665502, restart_reason);
 		} else if (!strcmp(cmd, "rtc")) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_RTC);
-			__raw_writel(0x77665503, restart_reason);
+			if (restart_reason)
+				__raw_writel(0x77665503, restart_reason);
 		} else if (!strcmp(cmd, "dm-verity device corrupted")) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_DMVERITY_CORRUPTED);
-			__raw_writel(0x77665508, restart_reason);
+			if (restart_reason)
+				__raw_writel(0x77665508, restart_reason);
 		} else if (!strcmp(cmd, "dm-verity enforcing")) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_DMVERITY_ENFORCE);
-			__raw_writel(0x77665509, restart_reason);
+			if (restart_reason)
+				__raw_writel(0x77665509, restart_reason);
 		} else if (!strcmp(cmd, "keys clear")) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_KEYS_CLEAR);
-			__raw_writel(0x7766550a, restart_reason);
+			if (restart_reason)
+				__raw_writel(0x7766550a, restart_reason);
 		} else if (!strncmp(cmd, "oem-", 4)) {
 			unsigned long code;
 			int ret;
 
 			ret = kstrtoul(cmd + 4, 16, &code);
-			if (!ret)
+			if (!ret && restart_reason)
 				__raw_writel(0x6f656d00 | (code & 0xff),
 					     restart_reason);
 		} else if (!strncmp(cmd, "edl", 3)) {
 			enable_emergency_dload_mode();
-		} else {
+		} else if (restart_reason) {
 			__raw_writel(0x77665501, restart_reason);
 		}
 	}
@@ -621,6 +658,7 @@ static int msm_restart_probe(struct platform_device *pdev)
 		pr_err("unable to find DT imem restart reason node\n");
 	} else {
 		restart_reason = of_iomap(np, 0);
+		of_node_put(np);
 		if (!restart_reason) {
 			pr_err("unable to map imem restart reason offset\n");
 			ret = -ENOMEM;
@@ -630,8 +668,10 @@ static int msm_restart_probe(struct platform_device *pdev)
 
 	mem = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pshold-base");
 	msm_ps_hold = devm_ioremap_resource(dev, mem);
-	if (IS_ERR(msm_ps_hold))
-		return PTR_ERR(msm_ps_hold);
+	if (IS_ERR(msm_ps_hold)) {
+		ret = PTR_ERR(msm_ps_hold);
+		goto err_ps_hold;
+	}
 
 	mem = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 					   "tcsr-boot-misc-detect");
@@ -656,6 +696,11 @@ static int msm_restart_probe(struct platform_device *pdev)
 
 	return 0;
 
+err_ps_hold:
+	if (restart_reason) {
+		iounmap(restart_reason);
+		restart_reason = NULL;
+	}
 err_restart_reason:
 	free_dload_mode_mem();
 	return ret;
