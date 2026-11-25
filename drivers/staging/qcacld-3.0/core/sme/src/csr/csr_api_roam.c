@@ -14217,6 +14217,8 @@ int8_t csr_get_cfg_max_tx_power(struct mac_context *mac, uint32_t ch_freq)
 	tSirMacChanInfo *pCountryInfo = NULL;
 	uint8_t count = 0;
 	uint8_t maxChannels;
+	uint8_t chan;
+	uint8_t first_chan;
 	int32_t rem_length = 0;
 
 	if (WLAN_REG_IS_5GHZ_CH_FREQ(ch_freq)) {
@@ -14232,6 +14234,10 @@ int8_t csr_get_cfg_max_tx_power(struct mac_context *mac, uint32_t ch_freq)
 	}
 
 	if (!cfg_length)
+		return maxTxPwr;
+
+	chan = wlan_reg_freq_to_chan(mac->pdev, ch_freq);
+	if (!chan)
 		return maxTxPwr;
 
 	pCountryInfo = qdf_mem_malloc(cfg_length);
@@ -14256,10 +14262,13 @@ int8_t csr_get_cfg_max_tx_power(struct mac_context *mac, uint32_t ch_freq)
 	rem_length = cfg_length;
 	while (rem_length >= (sizeof(tSirMacChanInfo))) {
 		maxChannels = pCountryInfo[count].numChannels;
-		maxTxPwr = pCountryInfo[count].maxTxPower;
+		first_chan = wlan_reg_freq_to_chan(
+					mac->pdev,
+					pCountryInfo[count].first_freq);
 
-		if (ch_freq >= pCountryInfo[count].first_freq &&
-		    ch_freq < (pCountryInfo[count].first_freq + maxChannels)) {
+		if (first_chan && chan >= first_chan &&
+		    chan < (first_chan + maxChannels)) {
+			maxTxPwr = pCountryInfo[count].maxTxPower;
 			break;
 		}
 		count++;
