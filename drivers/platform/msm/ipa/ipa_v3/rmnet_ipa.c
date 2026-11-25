@@ -1435,8 +1435,30 @@ static void apps_ipa_packet_receive_notify(void *priv,
 
 		IPAWANDBG_LOW("Rx packet was received");
 		skb->dev = IPA_NETDEV();
-		if (!rmnet_ipa3_ctx->no_qmap_config)
+		if (!rmnet_ipa3_ctx->no_qmap_config) {
 			skb->protocol = htons(ETH_P_MAP);
+		} else {
+			if (unlikely(!pskb_may_pull(skb, 1))) {
+				dev_kfree_skb_any(skb);
+				dev->stats.rx_dropped++;
+				return;
+			}
+			switch (skb->data[0] & 0xF0) {
+			case 0x40:
+				skb->protocol = htons(ETH_P_IP);
+				break;
+			case 0x60:
+				skb->protocol = htons(ETH_P_IPV6);
+				break;
+			default:
+				pr_err_ratelimited(
+					DEV_NAME " %s: invalid IP version 0x%x\n",
+					__func__, skb->data[0] >> 4);
+				dev_kfree_skb_any(skb);
+				dev->stats.rx_dropped++;
+				return;
+			}
+		}
 		skb_set_mac_header(skb, 0);
 
 		if (ipa3_rmnet_res.ipa_napi_enable) {
