@@ -903,7 +903,7 @@ static int vfsspi_sendNotify(int userPID, int signalID)
 
 	efd_ctx = eventfd_ctx_fileget(efd_file);
 	fput(efd_file);
-	if (efd_ctx == NULL) {
+	if (IS_ERR_OR_NULL(efd_ctx)) {
 		PR_ERR("eventfd_ctx_fileget is failed\n");
 		return -ENODEV;
 	}
