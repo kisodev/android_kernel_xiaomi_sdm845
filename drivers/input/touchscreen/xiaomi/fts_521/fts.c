@@ -162,6 +162,7 @@ static int fts_chip_initialization(struct fts_ts_info *info, int init_type);
 static const char *fts_get_limit(struct fts_ts_info *info);
 extern const char *dsi_get_display_name(void);
 
+static void fts_switch_mode_work(struct work_struct *work);
 static irqreturn_t fts_event_handler(int irq, void *ts_info);
 bool wait_queue_complete;
 
