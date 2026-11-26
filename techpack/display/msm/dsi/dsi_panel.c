@@ -822,15 +822,27 @@ static int dsi_panel_update_backlight(struct dsi_panel *panel,
 #if defined(CONFIG_MACH_XIAOMI_SDM845)
 static void dsi_panel_wled_cabc_ctrl(struct led_trigger *trig, bool enable)
 {
-	struct led_classdev *led_cdev;
+	struct led_classdev *led_cdev, *cdevs[4];
+	struct device *devs[4];
+	int i, count = 0;
 
 	if (!trig)
 		return;
 
 	read_lock(&trig->leddev_list_lock);
-	list_for_each_entry(led_cdev, &trig->led_cdevs, trig_list)
-		spmi_wled_cabc(led_cdev, enable);
+	list_for_each_entry(led_cdev, &trig->led_cdevs, trig_list) {
+		if (count >= ARRAY_SIZE(cdevs))
+			break;
+		cdevs[count] = led_cdev;
+		devs[count] = led_cdev->dev ? get_device(led_cdev->dev) : NULL;
+		count++;
+	}
 	read_unlock(&trig->leddev_list_lock);
+
+	for (i = 0; i < count; i++) {
+		spmi_wled_cabc(cdevs[i], enable);
+		put_device(devs[i]);
+	}
 }
 
 static void dsi_panel_offon_mode_control(struct dsi_panel *panel, u32 bl_lvl)
