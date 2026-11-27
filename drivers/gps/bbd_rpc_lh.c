@@ -665,6 +665,8 @@ static bool TransportLayer_PacketReceived(void *priv)
 						if (!BbdBridge_OnPacketReceived(pucData, usLen))
 							bcm_on_packet_received(priv, m_aucRxEscapedBuf, m_uiEscLen);
 					}
+				} else {
+					bcm_on_packet_received(priv, m_aucRxEscapedBuf, m_uiEscLen);
 				}
 				return true;
 			}

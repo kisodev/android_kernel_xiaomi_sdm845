@@ -766,7 +766,6 @@ static int bcm_ssi_tx(struct bcm_spi_priv *priv, int length)
 			Nread = bcm_ssi_get_len(strm->ctrl_byte, rx->data);
 			if (Nread > MAX_SPI_FRAME_LEN - strm->ctrl_len)
 				Nread = 0;
-			Nread = min_t(unsigned short, Nread, bytes_to_write);
 
 			if (Mwrite < Nread) {
 				/* Call BBD */
@@ -777,8 +776,13 @@ static int bcm_ssi_tx(struct bcm_spi_priv *priv, int length)
 			}
 
 			/* Call BBD */
-			if (bytes_to_write != 0 && Nread > 0)
-				bbd_parse_asic_data(data_p, Nread, NULL, priv);
+			if (bytes_to_write != 0 && Nread > 0) {
+				unsigned short to_parse = min_t(unsigned short,
+								bytes_to_write,
+								Nread);
+				bbd_parse_asic_data(data_p, to_parse, NULL, priv);
+				Nread -= to_parse;
+			}
 
 #ifdef CONFIG_TRANSFER_STAT
 			bcm_ssi_calc_trans_stat(&priv->trans_stat[1],
