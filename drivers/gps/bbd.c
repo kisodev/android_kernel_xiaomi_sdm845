@@ -293,9 +293,6 @@ ssize_t bbd_control(const char *buf, ssize_t len)
 
 		if (bbd.ssp_cb && bbd.ssp_cb->on_mcu_ready)
 			bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, true);
-#ifdef CONFIG_BCM_GPS_SPI_DRIVER
-		bcm477x_debug_info(ESW_CTRL_READY);
-#endif
 	} else if (strnstr(buf, ESW_CTRL_NOTREADY, len)) {
 		struct circ_buf *circ = &bbd.priv[BBD_MINOR_SENSOR].read_buf;
 
@@ -304,9 +301,6 @@ ssize_t bbd_control(const char *buf, ssize_t len)
 		mutex_unlock(&bbd.priv[BBD_MINOR_SENSOR].lock);
 		if (bbd.ssp_cb && bbd.ssp_cb->on_mcu_ready)
 			bbd.ssp_cb->on_mcu_ready(bbd.ssp_priv, false);
-#ifdef CONFIG_BCM_GPS_SPI_DRIVER
-		bcm477x_debug_info(ESW_CTRL_NOTREADY);
-#endif
 	} else if (strnstr(buf, ESW_CTRL_CRASHED, len)) {
 		struct circ_buf *circ = &bbd.priv[BBD_MINOR_SENSOR].read_buf;
 
@@ -319,9 +313,6 @@ ssize_t bbd_control(const char *buf, ssize_t len)
 
 		if (bbd.ssp_cb && bbd.ssp_cb->on_control)
 			bbd.ssp_cb->on_control(bbd.ssp_priv, buf);
-#ifdef CONFIG_BCM_GPS_SPI_DRIVER
-		bcm477x_debug_info(ESW_CTRL_CRASHED);
-#endif
 #if 0
 	} else if (strnstr(buf, BBD_CTRL_DEBUG_ON, len)) {
 		bbd.db = true;

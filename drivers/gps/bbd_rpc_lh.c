@@ -432,7 +432,7 @@ static bool BbdBridge_CheckPacketSanity(unsigned char *pucData,
 static int BbdBridge_OnPacketReceived(unsigned char *pucData,
 									  unsigned short usSize)
 {
-	int sensor = 0, gnss = 0;
+	int sensor = 0;
 	if (BbdBridge_CheckPacketSanity(pucData, usSize)) {
 		long lSize = (long)usSize;
 
@@ -455,8 +455,6 @@ static int BbdBridge_OnPacketReceived(unsigned char *pucData,
 			}
 			if (BbdBridge_OnRpcReceived(usRpcId, pucData, usRpcLen))
 				sensor++;
-			else
-				gnss++;
 			pucData += usRpcLen;
 			lSize -= usRpcLen;
 		}
@@ -502,18 +500,11 @@ static bool TransportLayer_PacketReceived(void *priv)
 		bool bReliablePacket = false;
 		unsigned char ucReliableSeqId = 0;
 
-		bool bReliableAckReceived = false;
-		unsigned char ucReliableAckSeqId = 0;
-
-		bool bReliableNackReceived = false;
-		unsigned char ucReliableNackSeqId = 0;
-
 		bool bAckReceived = false;
 
 		bool bInternalPacket = false;
 		bool bIgnoreSeqId = false;
 
-		unsigned short usAckFlags = 0;
 		unsigned int i = 0;
 
 		usLen -= 3;
@@ -540,12 +531,9 @@ static bool TransportLayer_PacketReceived(void *priv)
 				/* This is a reliable packet. we need to provide the proper Ack */
 				ucReliableSeqId = ucFlagDetail;
 				bReliablePacket = true;
-			} else if (usFlagBit == FLAG_RELIABLE_ACK) {
-				bReliableAckReceived = true;
-				ucReliableAckSeqId = ucFlagDetail;
-			} else if (usFlagBit == FLAG_RELIABLE_NACK) {
-				bReliableNackReceived = true;
-				ucReliableNackSeqId = ucFlagDetail;
+			} else if (usFlagBit == FLAG_RELIABLE_ACK ||
+				   usFlagBit == FLAG_RELIABLE_NACK) {
+				/* ignored legacy reliable ack/nack flags */
 			} else if (usFlagBit == FLAG_MSG_LOST) {
 				/* remote TransportLayer lost had some SeqId jumps */
 				m_otCurrentStats.ulRemotePacketLost += ucFlagDetail;
@@ -603,7 +591,6 @@ static bool TransportLayer_PacketReceived(void *priv)
 					pr_debug("Skip averted/%d %s %s\n", __LINE__,
 							(bAckReceived) ? "ACK"  : "!ack",
 							(bDelayedEnough) ? "ENUF" : "!enuf");
-					usAckFlags |= FLAG_PACKET_ACK;
 					m_ucDelayAckCount = 0;
 				} else {
 					pr_debug("Skip/%d %s %s %d\n", __LINE__,
@@ -634,15 +621,10 @@ static bool TransportLayer_PacketReceived(void *priv)
 						/* already received that packet, remote TransportLayer
 						 * probably lost the Acknowledgment, send it again
 						 */
-						usAckFlags |= FLAG_PACKET_ACK | FLAG_RELIABLE_ACK;
 						bProcessPacket = false; /* we should not process it again */
 					} else if (ucReliableSeqId == ((m_ucReliableSeqId+1)&0xFF)) {
 						/* this is a valid message, just do nothing but update
 						 * the reliable info. the message will be processed below
-						 */
-						usAckFlags |= FLAG_PACKET_ACK | FLAG_RELIABLE_ACK;
-						/* already received that packet, remote TransportLayer
-						 * probably lost the Acknowledgment, send it again
 						 */
 						m_usReliableLen   = usLen;
 						m_ucReliableSeqId = ucReliableSeqId;
@@ -650,7 +632,6 @@ static bool TransportLayer_PacketReceived(void *priv)
 						m_otCurrentStats.ulReliablePacketReceived++;
 					} else {
 						/* we received the wrong reliable SeqId */
-						usAckFlags |= FLAG_PACKET_ACK | FLAG_RELIABLE_NACK;
 						bProcessPacket = false; /* we cannot accept the packet */
 					}
 				}

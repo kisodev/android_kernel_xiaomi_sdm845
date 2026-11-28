@@ -1475,21 +1475,6 @@ static int bcm_spi_remove(struct spi_device *spi)
 	return 0;
 }
 
-void bcm477x_debug_info(const char *buf)
-{
-	int pin_ttyBCM, pin_MCU_REQ, pin_MCU_RESP;
-	int irq_enabled, irq_count;
-
-	if (g_bcm_gps) {
-		pin_ttyBCM = gpio_get_value(g_bcm_gps->host_req);
-		pin_MCU_REQ = gpio_get_value(g_bcm_gps->mcu_req);
-		pin_MCU_RESP = gpio_get_value(g_bcm_gps->mcu_resp);
-
-		irq_enabled = atomic_read(&g_bcm_gps->irq_enabled);
-		irq_count = kstat_irqs_cpu(g_bcm_gps->spi->irq, 0);
-	}
-}
-
 static const struct spi_device_id bcm_spi_id[] = {
 	{"ssp", 0},
 	{}
